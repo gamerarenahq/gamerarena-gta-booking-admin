@@ -2,28 +2,47 @@
 
 import { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
-import { Calendar, Monitor, User, Phone, Clock, Plus, Minus, AlertTriangle, ShieldCheck, Check, Trash2, Edit2, Rocket, Lock, X, CheckCircle2, MessageCircle } from 'lucide-react';
+import { Calendar, Monitor, User, Phone, Plus, Minus, AlertTriangle, ShieldCheck, Check, Trash2, Edit2, Rocket, Lock, X, MessageCircle } from 'lucide-react';
 
 const SYSTEMS = ['PS1', 'PS2', 'PS3'];
+
+// --- Type Definitions for Vercel Strict Mode ---
+type Booking = {
+  id: number;
+  customer_name: string;
+  phone_number: string;
+  system_id: string;
+  booking_date: string;
+  start_time: string;
+  duration: number;
+  status: string;
+};
 
 // --- Helper Functions ---
 const timeToMinutes = (timeStr: string) => {
   if (!timeStr) return 0;
   if (timeStr.includes('AM') || timeStr.includes('PM')) {
-    let [time, modifier] = timeStr.split(' ');
-    let [h, m] = time.split(':').map(Number);
+    const parts = timeStr.split(' ');
+    const time = parts[0];
+    const modifier = parts[1];
+    
+    const timeParts = time.split(':').map(Number);
+    let h = timeParts[0];
+    const m = timeParts[1];
+    
     if (modifier === 'PM' && h !== 12) h += 12;
     if (modifier === 'AM' && h === 12) h = 0;
     return h * 60 + m;
   }
-  const [h, m] = timeStr.split(':').map(Number);
-  return h * 60 + m;
+  const parts24 = timeStr.split(':').map(Number);
+  return parts24[0] * 60 + parts24[1];
 };
 
 const format12Hour = (time24: string) => {
   if (!time24) return '';
-  const [hStr, mStr] = time24.split(':');
-  let h = parseInt(hStr, 10);
+  const parts = time24.split(':');
+  let h = parseInt(parts[0], 10);
+  const mStr = parts[1];
   const ampm = h >= 12 ? 'PM' : 'AM';
   h = h % 12 || 12;
   return `${h.toString().padStart(2, '0')}:${mStr} ${ampm}`;
@@ -48,13 +67,13 @@ export default function GTADashboard() {
 
   // Automatically snaps to current IST date on load
   const [dateFilter, setDateFilter] = useState(() => getTodayString());
-  const [bookings, setBookings] = useState<any[]>([]);
+  const [bookings, setBookings] = useState<Booking[]>([]);
   const [isFetching, setIsFetching] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
 
   // Modal State
   const [modal, setModal] = useState<string | null>(null); // 'booking', 'push', null
-  const [selectedBooking, setSelectedBooking] = useState<any>(null); // Holds data for Edit/Push
+  const [selectedBooking, setSelectedBooking] = useState<Booking | null>(null); // Holds data for Edit/Push
 
   // Form State (For Create/Edit)
   const [formSystem, setFormSystem] = useState('PS1');
@@ -63,11 +82,6 @@ export default function GTADashboard() {
   const [duration, setDuration] = useState(2);
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
-
-  // Fetch bookings for the selected Date
-  useEffect(() => {
-    if (isAuthenticated) fetchBookings();
-  }, [dateFilter, isAuthenticated]);
 
   const fetchBookings = async () => {
     setIsFetching(true);
@@ -79,8 +93,8 @@ export default function GTADashboard() {
 
       if (error) throw error;
       if (data) {
-        const sorted = data.sort((a: any, b: any) => timeToMinutes(a.start_time) - timeToMinutes(b.start_time));
-        setBookings(sorted);
+        const sorted = data.sort((a: Booking, b: Booking) => timeToMinutes(a.start_time) - timeToMinutes(b.start_time));
+        setBookings(sorted as Booking[]);
       }
     } catch (err) {
       console.error("Fetch error:", err);
@@ -88,6 +102,12 @@ export default function GTADashboard() {
       setIsFetching(false);
     }
   };
+
+  // Fetch bookings for the selected Date
+  useEffect(() => {
+    if (isAuthenticated) fetchBookings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dateFilter, isAuthenticated]);
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -109,7 +129,7 @@ export default function GTADashboard() {
     setModal('booking');
   };
 
-  const openEditModal = (b: any) => {
+  const openEditModal = (b: Booking) => {
     setSelectedBooking(b);
     setFormSystem(b.system_id);
     setFormDate(b.booking_date);
@@ -117,12 +137,18 @@ export default function GTADashboard() {
     setPhone(b.phone_number);
     setDuration(Number(b.duration));
     
-    // Reverse engineer 12h to 24h for the time input
-    const [time, modifier] = b.start_time.split(' ');
-    let [h, m] = time.split(':');
-    if (modifier === 'PM' && h !== '12') h = String(Number(h) + 12);
-    if (modifier === 'AM' && h === '12') h = '00';
-    setStartTime24(`${h.padStart(2, '0')}:${m}`);
+    // Reverse engineer 12h to 24h for the time input safely
+    const parts = b.start_time.split(' ');
+    const timeVal = parts[0];
+    const modifierVal = parts[1];
+    
+    const timeParts = timeVal.split(':');
+    let hVal = timeParts[0];
+    const mVal = timeParts[1];
+    
+    if (modifierVal === 'PM' && hVal !== '12') hVal = String(Number(hVal) + 12);
+    if (modifierVal === 'AM' && hVal === '12') hVal = '00';
+    setStartTime24(`${hVal.padStart(2, '0')}:${mVal}`);
     
     setModal('booking');
   };
@@ -136,9 +162,7 @@ export default function GTADashboard() {
     const newEnd = newStart + (duration * 60);
 
     const conflict = bookings.find(b => {
-      // Ignore self when editing
       if (selectedBooking && b.id === selectedBooking.id) return false;
-      // Only check conflicts on the same system and date
       if (b.system_id !== formSystem || b.booking_date !== formDate) return false;
 
       const bStart = timeToMinutes(b.start_time);
@@ -177,6 +201,7 @@ export default function GTADashboard() {
       setModal(null);
       fetchBookings();
     } catch (err) {
+      console.error(err);
       alert('Error saving booking.');
     } finally {
       setIsProcessing(false);
@@ -224,8 +249,8 @@ export default function GTADashboard() {
       fetchBookings();
       alert(`Success! ${selectedBooking.customer_name} is now ACTIVE on the Live Floor.`);
     } catch (err) {
-      alert("Error pushing to live floor.");
       console.error(err);
+      alert("Error pushing to live floor.");
     } finally {
       setIsProcessing(false);
     }
@@ -233,7 +258,10 @@ export default function GTADashboard() {
   
   const copyWhatsAppMessage = () => {
     if (!selectedBooking) return;
-    const [y, m, d] = selectedBooking.booking_date.split('-');
+    const parts = selectedBooking.booking_date.split('-');
+    const y = parts[0];
+    const m = parts[1];
+    const d = parts[2];
     const dateObj = new Date(Number(y), Number(m) - 1, Number(d));
     const niceDate = `${d} ${dateObj.toLocaleString('en-US', { month: 'short' })} ${y}`;
     
