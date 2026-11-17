@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
-import { Calendar, Monitor, User, Phone, Plus, Minus, AlertTriangle, ShieldCheck, Check, Trash2, Edit2, Rocket, Lock, X, MessageCircle } from 'lucide-react';
+import { Calendar, Monitor, User, Phone, Plus, Minus, AlertTriangle, ShieldCheck, Check, Trash2, Edit2, Rocket, Lock, X, MessageCircle, CheckCircle2 } from 'lucide-react';
 
 const SYSTEMS = ['PS1', 'PS2', 'PS3'];
 
@@ -72,8 +72,8 @@ export default function GTADashboard() {
   const [isProcessing, setIsProcessing] = useState(false);
 
   // Modal State
-  const [modal, setModal] = useState<string | null>(null); // 'booking', 'push', null
-  const [selectedBooking, setSelectedBooking] = useState<Booking | null>(null); // Holds data for Edit/Push
+  const [modal, setModal] = useState<string | null>(null); // 'booking', 'push', 'whatsapp', null
+  const [selectedBooking, setSelectedBooking] = useState<Booking | null>(null); // Holds data for Edit/Push/WhatsApp
 
   // Form State (For Create/Edit)
   const [formSystem, setFormSystem] = useState('PS1');
@@ -147,7 +147,7 @@ export default function GTADashboard() {
     const mVal = timeParts[1];
     
     if (modifierVal === 'PM' && hVal !== '12') hVal = String(Number(hVal) + 12);
-    if (modifierVal === 'AM' && hVal === '12') hVal = '00';
+    if (modifier === 'AM' && hVal === '12') hVal = '00';
     setStartTime24(`${hVal.padStart(2, '0')}:${mVal}`);
     
     setModal('booking');
@@ -193,13 +193,25 @@ export default function GTADashboard() {
     };
 
     try {
+      let savedRecord = null;
       if (selectedBooking) {
-        await supabase.from('gta_bookings').update(payload).eq('id', selectedBooking.id);
+        const { data, error } = await supabase.from('gta_bookings').update(payload).eq('id', selectedBooking.id).select();
+        if (error) throw error;
+        if (data) savedRecord = data[0];
       } else {
-        await supabase.from('gta_bookings').insert([payload]);
+        const { data, error } = await supabase.from('gta_bookings').insert([payload]).select();
+        if (error) throw error;
+        if (data) savedRecord = data[0];
       }
+      
       setModal(null);
       fetchBookings();
+
+      // Instantly open the WhatsApp confirmation modal for the saved booking
+      if (savedRecord) {
+        setSelectedBooking(savedRecord as Booking);
+        setModal('whatsapp');
+      }
     } catch (err) {
       console.error(err);
       alert('Error saving booking.');
@@ -256,16 +268,15 @@ export default function GTADashboard() {
     }
   };
   
-  const copyWhatsAppMessage = () => {
-    if (!selectedBooking) return;
-    const parts = selectedBooking.booking_date.split('-');
+  const copyWhatsAppMessage = (b: Booking) => {
+    const parts = b.booking_date.split('-');
     const y = parts[0];
     const m = parts[1];
     const d = parts[2];
     const dateObj = new Date(Number(y), Number(m) - 1, Number(d));
     const niceDate = `${d} ${dateObj.toLocaleString('en-US', { month: 'short' })} ${y}`;
     
-    const text = `Dear *${selectedBooking.customer_name}*,\n\nThank you for choosing Gamerarena! Your exclusive GTA VI slot has been successfully secured. Here are your booking details:\n\n📅 *Date:* ${niceDate}\n⏰ *Start Time:* ${selectedBooking.start_time}\n⏳ *Duration:* ${selectedBooking.duration} Hours\n🎮 *Console:* ${selectedBooking.system_id}\n\n*⚠️ House Rules for Launch Week:*\n• *10-Minute Grace Period:* If you arrive more than 10 minutes late, your slot may be reassigned to the next waiting player.\n• *Hard Stops:* To ensure everyone gets their turn, sessions must end strictly on time if another gamer is scheduled after you.\n\nSee you at the arena! 🎮`;
+    const text = `Dear *${b.customer_name}*,\n\nThank you for choosing Gamerarena! Your exclusive GTA VI slot has been successfully secured. Here are your booking details:\n\n📅 *Date:* ${niceDate}\n⏰ *Start Time:* ${b.start_time}\n⏳ *Duration:* ${b.duration} Hours\n🎮 *Console:* ${b.system_id}\n\n*⚠️ House Rules for Launch Week:*\n• *10-Minute Grace Period:* If you arrive more than 10 minutes late, your slot may be reassigned to the next waiting player.\n• *Hard Stops:* To ensure everyone gets their turn, sessions must end strictly on time if another gamer is scheduled after you.\n\nSee you at the arena! 🎮`;
     
     navigator.clipboard.writeText(text);
     alert('WhatsApp message copied to clipboard!');
@@ -365,7 +376,7 @@ export default function GTADashboard() {
                                   <button onClick={() => { setSelectedBooking(b); setModal('push'); }} className="flex-1 bg-emerald-500 text-white py-2 rounded-lg text-xs font-black hover:bg-emerald-400 transition-all flex items-center justify-center gap-1.5 shadow-[0_0_10px_rgba(16,185,129,0.2)]">
                                      <Rocket size={14}/> Push to Live
                                   </button>
-                                  <button onClick={() => { setSelectedBooking(b); copyWhatsAppMessage(); }} className="bg-[#1A2235] text-[#00D0FF] px-3 py-2 rounded-lg hover:bg-white hover:text-black transition-all border border-[#2D3748]" title="Copy WhatsApp Message">
+                                  <button onClick={() => copyWhatsAppMessage(b)} className="bg-[#1A2235] text-[#00D0FF] px-3 py-2 rounded-lg hover:bg-white hover:text-black transition-all border border-[#2D3748]" title="Copy WhatsApp Message">
                                      <MessageCircle size={14}/>
                                   </button>
                                   <button onClick={() => openEditModal(b)} className="bg-[#1A2235] text-gray-400 px-3 py-2 rounded-lg hover:text-white transition-all border border-[#2D3748]" title="Edit">
@@ -392,6 +403,30 @@ export default function GTADashboard() {
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-[#121824] border border-[#1E293B] rounded-2xl w-full max-w-md overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200">
             
+            {/* Modal: WhatsApp Confirmation Popup on New/Edit Booking */}
+            {modal === 'whatsapp' && selectedBooking && (
+              <div className="p-6 text-center">
+                <CheckCircle2 size={50} className="text-[#00D0FF] mx-auto mb-4" />
+                <h2 className="text-xl font-black mb-2">Slot Locked Successfully!</h2>
+                <p className="text-gray-400 text-xs mb-6">Click below to copy the WhatsApp confirmation message for <strong>{selectedBooking.customer_name}</strong>.</p>
+                
+                <div className="bg-[#0B0E14] border border-[#2D3748] rounded-xl p-4 text-left mb-6 space-y-1">
+                   <p className="text-white text-xs font-bold">📅 Date: {selectedBooking.booking_date}</p>
+                   <p className="text-[#00D0FF] text-xs font-black">⏰ Time: {selectedBooking.start_time} ({selectedBooking.duration}h)</p>
+                   <p className="text-gray-400 text-xs font-bold">🎮 Console: {selectedBooking.system_id}</p>
+                </div>
+
+                <div className="flex flex-col gap-3">
+                  <button onClick={() => { copyWhatsAppMessage(selectedBooking); setModal(null); }} className="w-full bg-emerald-500 text-white py-3.5 rounded-xl font-black hover:bg-emerald-400 transition-all flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(16,185,129,0.3)] text-sm">
+                    <MessageCircle size={16} /> Copy WhatsApp Message
+                  </button>
+                  <button onClick={() => setModal(null)} className="w-full bg-[#1A2235] text-white py-3.5 rounded-xl font-bold border border-[#2D3748] hover:bg-gray-700 transition-all text-sm">
+                    Close / Done
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Modal: Push to Live Floor */}
             {modal === 'push' && selectedBooking && (
               <div className="p-6">
