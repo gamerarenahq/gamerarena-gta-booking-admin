@@ -1,6 +1,4 @@
 'use client'
-// @ts-nocheck
-/* eslint-disable */
 
 import { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
@@ -9,7 +7,7 @@ import { Calendar, Monitor, User, Phone, Clock, Plus, Minus, AlertTriangle, Shie
 const SYSTEMS = ['PS1', 'PS2', 'PS3'];
 
 // --- Helper Functions ---
-const timeToMinutes = (timeStr) => {
+const timeToMinutes = (timeStr: string) => {
   if (!timeStr) return 0;
   if (timeStr.includes('AM') || timeStr.includes('PM')) {
     let [time, modifier] = timeStr.split(' ');
@@ -22,7 +20,7 @@ const timeToMinutes = (timeStr) => {
   return h * 60 + m;
 };
 
-const format12Hour = (time24) => {
+const format12Hour = (time24: string) => {
   if (!time24) return '';
   const [hStr, mStr] = time24.split(':');
   let h = parseInt(hStr, 10);
@@ -33,12 +31,12 @@ const format12Hour = (time24) => {
 
 const getTodayString = () => {
   const d = new Date();
-  const options = { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' };
+  const options = { timeZone: 'Asia/Kolkata', year: 'numeric' as const, month: '2-digit' as const, day: '2-digit' as const };
   return new Intl.DateTimeFormat('en-CA', options).format(d);
 };
 
 // Calculates base cost for PS5
-const getPrice = (dur, extra = 0) => {
+const getPrice = (dur: number, extra: number = 0) => {
   const full = Math.floor(dur);
   const half = (dur % 1 !== 0) ? 1 : 0;
   return (full * (150 + (extra * 100))) + (half * (100 + (extra * 100)));
@@ -50,13 +48,13 @@ export default function GTADashboard() {
 
   // Automatically snaps to current IST date on load
   const [dateFilter, setDateFilter] = useState(() => getTodayString());
-  const [bookings, setBookings] = useState([]);
+  const [bookings, setBookings] = useState<any[]>([]);
   const [isFetching, setIsFetching] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
 
   // Modal State
-  const [modal, setModal] = useState(null); // 'booking', 'push', null
-  const [selectedBooking, setSelectedBooking] = useState(null); // Holds data for Edit/Push
+  const [modal, setModal] = useState<string | null>(null); // 'booking', 'push', null
+  const [selectedBooking, setSelectedBooking] = useState<any>(null); // Holds data for Edit/Push
 
   // Form State (For Create/Edit)
   const [formSystem, setFormSystem] = useState('PS1');
@@ -81,7 +79,7 @@ export default function GTADashboard() {
 
       if (error) throw error;
       if (data) {
-        const sorted = data.sort((a, b) => timeToMinutes(a.start_time) - timeToMinutes(b.start_time));
+        const sorted = data.sort((a: any, b: any) => timeToMinutes(a.start_time) - timeToMinutes(b.start_time));
         setBookings(sorted);
       }
     } catch (err) {
@@ -91,7 +89,7 @@ export default function GTADashboard() {
     }
   };
 
-  const handleLogin = (e) => {
+  const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
     if (password === 'gta2026') {
       setIsAuthenticated(true);
@@ -111,7 +109,7 @@ export default function GTADashboard() {
     setModal('booking');
   };
 
-  const openEditModal = (b) => {
+  const openEditModal = (b: any) => {
     setSelectedBooking(b);
     setFormSystem(b.system_id);
     setFormDate(b.booking_date);
@@ -154,7 +152,7 @@ export default function GTADashboard() {
     }
   }
 
-  const handleSaveBooking = async (e) => {
+  const handleSaveBooking = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isProcessing || isOverlapping || !startTime24 || !name || phone.length < 10) return;
     setIsProcessing(true);
@@ -185,7 +183,7 @@ export default function GTADashboard() {
     }
   };
 
-  const handleDelete = async (id) => {
+  const handleDelete = async (id: number) => {
     if (!window.confirm("Are you sure you want to delete this booking?")) return;
     setIsProcessing(true);
     await supabase.from('gta_bookings').delete().eq('id', id);
