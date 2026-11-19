@@ -43,9 +43,13 @@ type Booking = {
 };
 
 type ActiveSale = {
+  id?: number;
   customer: string;
   system: string;
   status: string;
+  duration?: number;
+  total?: number;
+  fnb_total?: number;
 };
 
 type TimeWindow = {
@@ -165,7 +169,6 @@ const getAvailableSlots1HrPlus = (
 ): TimeWindow[] => {
   if (!selectedDate || selectedDate < istNow.dateStr) return [];
 
-  // Only clip past times if selectedDate is TODAY in IST; future dates always start at 10:00 AM
   const roundedNow = Math.ceil(istNow.currentMinutes / 5) * 5;
   const startBoundary =
     selectedDate === istNow.dateStr
@@ -174,7 +177,6 @@ const getAvailableSlots1HrPlus = (
 
   if (startBoundary >= CLOSING_MINS) return [];
 
-  // Exclude No-Show bookings so their time windows become available again
   const blocks = sysBookings
     .filter((b) => b.booking_date === selectedDate && b.status !== 'No-Show')
     .map((b) => {
@@ -218,6 +220,7 @@ export default function GTADashboard() {
   const [loadedDate, setLoadedDate] = useState<string>('');
   const [isFetching, setIsFetching] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [extendingId, setExtendingId] = useState<number | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(() => getISTParts());
 
@@ -243,7 +246,11 @@ export default function GTADashboard() {
     try {
       const [bookingsRes, salesRes] = await Promise.all([
         supabase.from('gta_bookings').select('*').eq('booking_date', targetDate),
-        supabase.from('sales').select('customer, system, status').eq('date', targetDate).eq('status', 'Active'),
+        supabase
+          .from('sales')
+          .select('id, customer, system, status, duration, total, fnb_total')
+          .eq('date', targetDate)
+          .eq('status', 'Active'),
       ]);
 
       if (bookingsRes.error) throw bookingsRes.error;
@@ -445,6 +452,84 @@ export default function GTADashboard() {
     }
   };
 
+  // Calculate maximum buffer minutes available right after a booking on the same console
+  const getAvailableBufferMins = (b: Booking, sysBookings: Booking[]) => {
+    const endMins = timeToMinutes(b.start_time) + Number(b.duration) * 60;
+    if (endMins >= CLOSING_MINS) return 0;
+
+    const upcomingOnSameSys = sysBookings
+      .filter(
+        (other) =>
+          other.id !== b.id &&
+          other.status !== 'No-Show' &&
+          timeToMinutes(other.start_time) >= endMins
+      )
+      .sort((a, c) => timeToMinutes(a.start_time) - timeToMinutes(c.start_time));
+
+    const nextLimit =
+      upcomingOnSameSys.length > 0
+        ? Math.min(CLOSING_MINS, timeToMinutes(upcomingOnSameSys[0].start_time))
+        : CLOSING_MINS;
+
+    return Math.max(0, nextLimit - endMins);
+  };
+
+  // Extend an Active on Live Floor session (updates both gta_bookings and live POS sales table)
+  const handleExtendActiveSession = async (b: Booking, extraHours: number, availableBufferMins: number) => {
+    const extraMins = extraHours * 60;
+    if (extraMins > availableBufferMins || extendingId !== null) return;
+
+    const newDuration = Number(b.duration) + extraHours;
+    const newEndFormatted = minutesTo12Hour(timeToMinutes(b.start_time) + newDuration * 60);
+
+    setExtendingId(b.id);
+    try {
+      // 1. Update gta_bookings duration
+      const { error: bookingError } = await supabase
+        .from('gta_bookings')
+        .update({ duration: newDuration })
+        .eq('id', b.id);
+
+      if (bookingError) throw bookingError;
+
+      // 2. Sync updated duration & base gaming total to matching Active session in live POS `sales` table
+      const { data: matchingSales, error: salesFetchError } = await supabase
+        .from('sales')
+        .select('id, customer, system, fnb_total')
+        .eq('date', b.booking_date)
+        .eq('system', b.system_id)
+        .eq('status', 'Active');
+
+      if (!salesFetchError && matchingSales && matchingSales.length > 0) {
+        const matchedSale =
+          matchingSales.find(
+            (s) => s.customer.trim().toLowerCase() === b.customer_name.trim().toLowerCase()
+          ) || matchingSales[0];
+
+        const fnbTotal = Number(matchedSale.fnb_total || 0);
+        const updatedTotal = getPrice(newDuration, 0) + fnbTotal;
+
+        const { error: salesUpdateError } = await supabase
+          .from('sales')
+          .update({
+            duration: newDuration,
+            total: updatedTotal,
+          })
+          .eq('id', matchedSale.id);
+
+        if (salesUpdateError) throw salesUpdateError;
+      }
+
+      await fetchBookings(dateFilter, true);
+      alert(`Extended ${b.customer_name} by +${extraHours}h (Now ends at ${newEndFormatted}).`);
+    } catch (err) {
+      console.error('Extend error:', err);
+      alert('Error extending live session.');
+    } finally {
+      setExtendingId(null);
+    }
+  };
+
   const handleMarkNoShow = async (b: Booking) => {
     if (!window.confirm(`Mark ${b.customer_name} as No-Show? This will release their ${b.start_time} slot on ${b.system_id}.`)) return;
     setIsProcessing(true);
@@ -504,7 +589,6 @@ export default function GTADashboard() {
     const totalCost = getPrice(selectedBooking.duration, 0);
 
     try {
-      // Check if an Active session is already running on that console in POS
       const { data: existingActive } = await supabase
         .from('sales')
         .select('customer, system')
@@ -821,6 +905,13 @@ export default function GTADashboard() {
                       const endMins = startMins + Number(b.duration) * 60;
                       const endTimeFormatted = minutesTo12Hour(endMins);
 
+                      // Buffer available right after this session before next booking or midnight
+                      const bufferMins =
+                        b.status !== 'No-Show' ? getAvailableBufferMins(b, activeSysBookings) : 0;
+                      const canExtend30m = bufferMins >= 30;
+                      const canExtend1h = bufferMins >= 60;
+                      const isExtendingThis = extendingId === b.id;
+
                       // Check if another active booking on the same system starts immediately at endMins (Hard Stop)
                       const hasBackToBackNext =
                         b.status !== 'No-Show' &&
@@ -835,7 +926,7 @@ export default function GTADashboard() {
                             b.status === 'No-Show'
                               ? 'bg-[#0B0E14]/60 border-gray-800 opacity-55'
                               : b.status === 'Pushed'
-                                ? 'bg-[#0B0E14] border-emerald-500/30 opacity-80'
+                                ? 'bg-[#0B0E14] border-emerald-500/40'
                                 : countdown.isUrgent30Min
                                   ? 'bg-red-950/35 border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.2)]'
                                   : 'bg-[#0B0E14] border-[#2D3748] hover:border-[#00D0FF]/40'
@@ -852,7 +943,7 @@ export default function GTADashboard() {
                                   b.status === 'No-Show'
                                     ? 'bg-gray-800 text-gray-400'
                                     : b.status === 'Pushed'
-                                      ? 'bg-emerald-500/10 text-emerald-400'
+                                      ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
                                       : countdown.isUrgent30Min
                                         ? 'bg-red-500/20 text-red-400 border border-red-500/40'
                                         : 'bg-[#00D0FF]/10 text-[#00D0FF]'
@@ -888,8 +979,45 @@ export default function GTADashboard() {
                           )}
 
                           {b.status === 'Pushed' ? (
-                            <div className="mt-3 flex items-center justify-center gap-1.5 bg-emerald-500/10 text-emerald-500 py-2 rounded-lg text-xs font-black uppercase tracking-widest border border-emerald-500/20">
-                              <Check size={14} /> Active on Live Floor
+                            <div className="mt-3 pt-3 border-t border-[#1E293B] space-y-2.5">
+                              <div className="flex items-center justify-between gap-2 bg-emerald-500/10 text-emerald-400 px-3 py-2 rounded-lg text-xs font-black uppercase tracking-wider border border-emerald-500/20">
+                                <span className="flex items-center gap-1.5">
+                                  <Check size={14} /> Active on Live Floor
+                                </span>
+                                <span className="text-[10px] font-bold text-emerald-300/80">
+                                  {bufferMins > 0 ? `${bufferMins}m buffer` : 'No buffer'}
+                                </span>
+                              </div>
+
+                              {/* Buffer-aware Extension Controls for Live Sessions */}
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  disabled={!canExtend30m || isExtendingThis}
+                                  onClick={() => handleExtendActiveSession(b, 0.5, bufferMins)}
+                                  className="flex-1 bg-[#1A2235] text-[#00D0FF] hover:bg-[#00D0FF] hover:text-black disabled:opacity-30 disabled:pointer-events-none py-2 rounded-lg text-xs font-black border border-[#2D3748] transition-all"
+                                  title={
+                                    canExtend30m
+                                      ? `Extend by 30 mins (until ${minutesTo12Hour(endMins + 30)})`
+                                      : 'Less than 30m buffer before next slot'
+                                  }
+                                >
+                                  {isExtendingThis ? 'Updating...' : '+30m Extend'}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={!canExtend1h || isExtendingThis}
+                                  onClick={() => handleExtendActiveSession(b, 1, bufferMins)}
+                                  className="flex-1 bg-[#1A2235] text-emerald-400 hover:bg-emerald-500 hover:text-white disabled:opacity-30 disabled:pointer-events-none py-2 rounded-lg text-xs font-black border border-[#2D3748] transition-all"
+                                  title={
+                                    canExtend1h
+                                      ? `Extend by 1 hour (until ${minutesTo12Hour(endMins + 60)})`
+                                      : 'Less than 1h buffer before next slot'
+                                  }
+                                >
+                                  {isExtendingThis ? 'Updating...' : '+1h Extend'}
+                                </button>
+                              </div>
                             </div>
                           ) : b.status === 'No-Show' ? (
                             <div className="mt-3 pt-3 border-t border-[#1E293B] flex items-center justify-between gap-2">
