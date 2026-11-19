@@ -24,6 +24,7 @@ import {
   RefreshCw,
   UserX,
   ExternalLink,
+  ArrowLeftRight,
 } from 'lucide-react';
 
 const SYSTEMS = ['PS1', 'PS2', 'PS3'];
@@ -222,13 +223,14 @@ export default function GTADashboard() {
   const [loadedDate, setLoadedDate] = useState<string>('');
   const [isFetching, setIsFetching] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [extendingId, setExtendingId] = useState<number | null>(null);
+  const [busyBookingId, setBusyBookingId] = useState<number | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(() => getISTParts());
 
   // Modal State
   const [modal, setModal] = useState<string | null>(null); // 'booking', 'push', 'whatsapp', null
   const [selectedBooking, setSelectedBooking] = useState<Booking | null>(null);
+  const [swapTargetId, setSwapTargetId] = useState<string>('');
 
   // Form State (For Create/Edit)
   const [formSystem, setFormSystem] = useState('PS1');
@@ -261,7 +263,6 @@ export default function GTADashboard() {
       const rawBookings = (bookingsRes.data || []) as Booking[];
       setActiveSales(currentActiveSales);
 
-      // Keep all bookings for cumulative booked-hours totals; Kanban board filters out closed POS sessions
       const sorted = rawBookings.sort(
         (a: Booking, b: Booking) => timeToMinutes(a.start_time) - timeToMinutes(b.start_time)
       );
@@ -331,6 +332,7 @@ export default function GTADashboard() {
 
   const openCreateModal = (presetSystem?: string, presetStartMins?: number) => {
     setSelectedBooking(null);
+    setSwapTargetId('');
     setFormSystem(presetSystem || 'PS1');
     setFormDate(dateFilter);
     setStartTime24(presetStartMins !== undefined ? minutesTo24Hour(presetStartMins) : '');
@@ -342,6 +344,7 @@ export default function GTADashboard() {
 
   const openEditModal = (b: Booking) => {
     setSelectedBooking(b);
+    setSwapTargetId('');
     setFormSystem(b.system_id);
     setFormDate(b.booking_date);
     setName(b.customer_name);
@@ -364,7 +367,22 @@ export default function GTADashboard() {
     setModal('booking');
   };
 
-  // Smart Collision Logic for Modal (ignores No-Show bookings)
+  // All valid bookings for the selected date (never reduced when a pushed session ends in POS)
+  const activeDateBookings = bookings.filter((b) => b.booking_date === dateFilter);
+  const validBookedSlots = activeDateBookings.filter((b) => b.status !== 'No-Show');
+  const totalBookedHours = validBookedSlots.reduce((sum, b) => sum + Number(b.duration || 0), 0);
+
+  // Kanban card list hides completed Pushed sessions once they are no longer Active in POS
+  const kanbanBookings = activeDateBookings.filter((b) => {
+    if (b.status !== 'Pushed') return true;
+    return activeSales.some(
+      (s) =>
+        s.system === b.system_id &&
+        s.customer.trim().toLowerCase() === b.customer_name.trim().toLowerCase()
+    );
+  });
+
+  // Smart Collision Logic for Modal (ignores No-Show bookings and finished POS sessions)
   let isOverlapping = false;
   let overlapWarning = '';
 
@@ -372,7 +390,7 @@ export default function GTADashboard() {
     const newStart = timeToMinutes(startTime24);
     const newEnd = newStart + duration * 60;
 
-    const conflict = bookings.find((b) => {
+    const conflict = kanbanBookings.find((b) => {
       if (b.status === 'No-Show') return false;
       if (selectedBooking && b.id === selectedBooking.id) return false;
       if (b.system_id !== formSystem || b.booking_date !== formDate) return false;
@@ -387,6 +405,147 @@ export default function GTADashboard() {
       overlapWarning = `Overlaps with ${conflict.customer_name} (${conflict.start_time} – ${minutesTo12Hour(timeToMinutes(conflict.start_time) + Number(conflict.duration) * 60)})`;
     }
   }
+
+  // Helper to sync a Pushed booking's system/duration changes to the live POS `sales` table
+  const syncLiveSaleRecord = async (
+    oldBooking: Booking,
+    updates: { system?: string; duration?: number }
+  ) => {
+    const { data: matchingSales, error: salesFetchError } = await supabase
+      .from('sales')
+      .select('id, customer, system, duration, fnb_total')
+      .eq('date', oldBooking.booking_date)
+      .eq('system', oldBooking.system_id)
+      .eq('status', 'Active');
+
+    if (salesFetchError || !matchingSales || matchingSales.length === 0) return;
+
+    const matchedSale =
+      matchingSales.find(
+        (s) => s.customer.trim().toLowerCase() === oldBooking.customer_name.trim().toLowerCase()
+      ) || matchingSales[0];
+
+    const finalDuration = updates.duration !== undefined ? updates.duration : Number(oldBooking.duration);
+    const fnbTotal = Number(matchedSale.fnb_total || 0);
+    const updatedTotal = getPrice(finalDuration, 0) + fnbTotal;
+
+    const salePayload: { system?: string; duration?: number; total?: number } = {};
+    if (updates.system) salePayload.system = updates.system;
+    if (updates.duration !== undefined) {
+      salePayload.duration = finalDuration;
+      salePayload.total = updatedTotal;
+    }
+
+    const { error: salesUpdateError } = await supabase
+      .from('sales')
+      .update(salePayload)
+      .eq('id', matchedSale.id);
+
+    if (salesUpdateError) throw salesUpdateError;
+  };
+
+  // Check if moving booking `b` to `targetSys` (at its same start_time & duration) has any collision
+  const getMoveConflict = (b: Booking, targetSys: string) => {
+    const start = timeToMinutes(b.start_time);
+    const end = start + Number(b.duration) * 60;
+
+    // Also block moving a Pushed session if targetSys already has a different Active floor session running right now
+    if (b.status === 'Pushed') {
+      const liveFloorCollision = activeSales.find((s) => s.system === targetSys);
+      if (liveFloorCollision) {
+        return `${liveFloorCollision.customer} is active on ${targetSys}`;
+      }
+    }
+
+    const conflict = kanbanBookings.find((other) => {
+      if (other.id === b.id || other.status === 'No-Show') return false;
+      if (other.system_id !== targetSys || other.booking_date !== b.booking_date) return false;
+      const oStart = timeToMinutes(other.start_time);
+      const oEnd = oStart + Number(other.duration) * 60;
+      return start < oEnd && end > oStart;
+    });
+
+    return conflict ? `${conflict.customer_name} (${conflict.start_time})` : null;
+  };
+
+  // One-Tap Move to another PS5 console (works for both Upcoming and Active on Live Floor)
+  const handleMoveSystem = async (b: Booking, targetSys: string) => {
+    if (targetSys === b.system_id || busyBookingId !== null) return;
+    const conflictText = getMoveConflict(b, targetSys);
+    if (conflictText) {
+      alert(`Cannot move to ${targetSys}: blocked by ${conflictText}.`);
+      return;
+    }
+
+    setBusyBookingId(b.id);
+    try {
+      const { error } = await supabase
+        .from('gta_bookings')
+        .update({ system_id: targetSys })
+        .eq('id', b.id);
+
+      if (error) throw error;
+
+      if (b.status === 'Pushed') {
+        await syncLiveSaleRecord(b, { system: targetSys });
+      }
+
+      await fetchBookings(dateFilter, true);
+    } catch (err) {
+      console.error('Move system error:', err);
+      alert(`Error moving ${b.customer_name} to ${targetSys}.`);
+    } finally {
+      setBusyBookingId(null);
+    }
+  };
+
+  // Atomically swap two bookings' console & start time (for shuffling back-to-back slots cleanly)
+  const handleSwapBookings = async () => {
+    if (!selectedBooking || !swapTargetId || isProcessing) return;
+    const targetBooking = kanbanBookings.find((b) => String(b.id) === swapTargetId);
+    if (!targetBooking) return;
+
+    setIsProcessing(true);
+    try {
+      const firstUpdates = {
+        system_id: targetBooking.system_id,
+        start_time: targetBooking.start_time,
+        booking_date: targetBooking.booking_date,
+      };
+      const secondUpdates = {
+        system_id: selectedBooking.system_id,
+        start_time: selectedBooking.start_time,
+        booking_date: selectedBooking.booking_date,
+      };
+
+      const [res1, res2] = await Promise.all([
+        supabase.from('gta_bookings').update(firstUpdates).eq('id', selectedBooking.id),
+        supabase.from('gta_bookings').update(secondUpdates).eq('id', targetBooking.id),
+      ]);
+
+      if (res1.error) throw res1.error;
+      if (res2.error) throw res2.error;
+
+      if (selectedBooking.status === 'Pushed') {
+        await syncLiveSaleRecord(selectedBooking, { system: firstUpdates.system_id });
+      }
+      if (targetBooking.status === 'Pushed') {
+        await syncLiveSaleRecord(targetBooking, { system: secondUpdates.system_id });
+      }
+
+      setModal(null);
+      setSwapTargetId('');
+      await fetchBookings(dateFilter);
+      alert(
+        `Swapped! ${selectedBooking.customer_name} is now on ${firstUpdates.system_id} at ${firstUpdates.start_time}, and ${targetBooking.customer_name} is on ${secondUpdates.system_id} at ${secondUpdates.start_time}.`
+      );
+    } catch (err) {
+      console.error('Swap error:', err);
+      alert('Error swapping slots.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
 
   const handleSaveBooking = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -415,6 +574,13 @@ export default function GTADashboard() {
           .single();
         if (error) throw error;
         savedRecord = (data || { ...selectedBooking, ...payload }) as Booking;
+
+        if (selectedBooking.status === 'Pushed') {
+          await syncLiveSaleRecord(selectedBooking, {
+            system: formSystem,
+            duration: duration,
+          });
+        }
       } else {
         const { data, error } = await supabase
           .from('gta_bookings')
@@ -469,12 +635,12 @@ export default function GTADashboard() {
   // Extend an Active on Live Floor session (updates both gta_bookings and live POS sales table)
   const handleExtendActiveSession = async (b: Booking, extraHours: number, availableBufferMins: number) => {
     const extraMins = extraHours * 60;
-    if (extraMins > availableBufferMins || extendingId !== null) return;
+    if (extraMins > availableBufferMins || busyBookingId !== null) return;
 
     const newDuration = Number(b.duration) + extraHours;
     const newEndFormatted = minutesTo12Hour(timeToMinutes(b.start_time) + newDuration * 60);
 
-    setExtendingId(b.id);
+    setBusyBookingId(b.id);
     try {
       const { error: bookingError } = await supabase
         .from('gta_bookings')
@@ -483,32 +649,7 @@ export default function GTADashboard() {
 
       if (bookingError) throw bookingError;
 
-      const { data: matchingSales, error: salesFetchError } = await supabase
-        .from('sales')
-        .select('id, customer, system, fnb_total')
-        .eq('date', b.booking_date)
-        .eq('system', b.system_id)
-        .eq('status', 'Active');
-
-      if (!salesFetchError && matchingSales && matchingSales.length > 0) {
-        const matchedSale =
-          matchingSales.find(
-            (s) => s.customer.trim().toLowerCase() === b.customer_name.trim().toLowerCase()
-          ) || matchingSales[0];
-
-        const fnbTotal = Number(matchedSale.fnb_total || 0);
-        const updatedTotal = getPrice(newDuration, 0) + fnbTotal;
-
-        const { error: salesUpdateError } = await supabase
-          .from('sales')
-          .update({
-            duration: newDuration,
-            total: updatedTotal,
-          })
-          .eq('id', matchedSale.id);
-
-        if (salesUpdateError) throw salesUpdateError;
-      }
+      await syncLiveSaleRecord(b, { duration: newDuration });
 
       await fetchBookings(dateFilter, true);
       alert(`Extended ${b.customer_name} by +${extraHours}h (Now ends at ${newEndFormatted}, Total: ₹${getPrice(newDuration, 0)}).`);
@@ -516,7 +657,7 @@ export default function GTADashboard() {
       console.error('Extend error:', err);
       alert('Error extending live session.');
     } finally {
-      setExtendingId(null);
+      setBusyBookingId(null);
     }
   };
 
@@ -683,21 +824,6 @@ export default function GTADashboard() {
     };
   };
 
-  // All valid bookings for the selected date (never reduced when a pushed session ends in POS)
-  const activeDateBookings = bookings.filter((b) => b.booking_date === dateFilter);
-  const validBookedSlots = activeDateBookings.filter((b) => b.status !== 'No-Show');
-  const totalBookedHours = validBookedSlots.reduce((sum, b) => sum + Number(b.duration || 0), 0);
-
-  // Kanban card list hides completed Pushed sessions once they are no longer Active in POS
-  const kanbanBookings = activeDateBookings.filter((b) => {
-    if (b.status !== 'Pushed') return true;
-    return activeSales.some(
-      (s) =>
-        s.system === b.system_id &&
-        s.customer.trim().toLowerCase() === b.customer_name.trim().toLowerCase()
-    );
-  });
-
   const modalOpenWindows =
     modal === 'booking' && formDate
       ? getAvailableSlots1HrPlus(
@@ -709,6 +835,14 @@ export default function GTADashboard() {
           ),
           formDate,
           nowTick
+        )
+      : [];
+
+  // Other active/upcoming bookings on the same date that can be swapped with `selectedBooking`
+  const swappableBookings =
+    modal === 'booking' && selectedBooking
+      ? kanbanBookings.filter(
+          (b) => b.id !== selectedBooking.id && b.status !== 'No-Show'
         )
       : [];
 
@@ -906,18 +1040,20 @@ export default function GTADashboard() {
                       const endMins = startMins + Number(b.duration) * 60;
                       const endTimeFormatted = minutesTo12Hour(endMins);
                       const bookingTotal = getPrice(Number(b.duration), 0);
+                      const isBusyThis = busyBookingId === b.id;
 
                       const bufferMins =
                         b.status !== 'No-Show' ? getAvailableBufferMins(b, activeSysBookings) : 0;
                       const canExtend30m = bufferMins >= 30;
                       const canExtend1h = bufferMins >= 60;
-                      const isExtendingThis = extendingId === b.id;
 
                       const hasBackToBackNext =
                         b.status !== 'No-Show' &&
                         activeSysBookings.some(
                           (other) => other.id !== b.id && timeToMinutes(other.start_time) === endMins
                         );
+
+                      const otherConsoles = SYSTEMS.filter((s) => s !== b.system_id);
 
                       return (
                         <div
@@ -980,8 +1116,46 @@ export default function GTADashboard() {
                             </div>
                           )}
 
+                          {/* Quick Console Shift Bar (Available for both Upcoming and Live Floor sessions) */}
+                          {b.status !== 'No-Show' && (
+                            <div className="mb-2.5 flex items-center gap-1.5">
+                              <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500 flex items-center gap-1 mr-1">
+                                <ArrowLeftRight size={11} className="text-[#00D0FF]" /> Move:
+                              </span>
+                              {otherConsoles.map((targetSys) => {
+                                const moveConflict = getMoveConflict(b, targetSys);
+                                return (
+                                  <button
+                                    key={targetSys}
+                                    type="button"
+                                    disabled={Boolean(moveConflict) || isBusyThis}
+                                    onClick={() => handleMoveSystem(b, targetSys)}
+                                    className="px-2 py-1 rounded-md text-[10px] font-black bg-[#121824] text-gray-300 hover:bg-[#00D0FF] hover:text-black disabled:opacity-30 disabled:pointer-events-none border border-[#2D3748] transition-all"
+                                    title={
+                                      moveConflict
+                                        ? `${targetSys} busy: ${moveConflict}`
+                                        : `Switch ${b.customer_name} to ${targetSys}`
+                                    }
+                                  >
+                                    → {targetSys}
+                                  </button>
+                                );
+                              })}
+                              {b.status === 'Pushed' && (
+                                <button
+                                  type="button"
+                                  onClick={() => openEditModal(b)}
+                                  className="ml-auto px-2 py-1 rounded-md text-[10px] font-black bg-[#121824] text-gray-400 hover:text-white border border-[#2D3748] transition-all"
+                                  title="Edit or Swap Live Session"
+                                >
+                                  Swap / Edit
+                                </button>
+                              )}
+                            </div>
+                          )}
+
                           {b.status === 'Pushed' ? (
-                            <div className="mt-3 pt-3 border-t border-[#1E293B] space-y-2.5">
+                            <div className="mt-2 pt-2.5 border-t border-[#1E293B] space-y-2.5">
                               <div className="flex items-center justify-between gap-2 bg-emerald-500/10 text-emerald-400 px-3 py-2 rounded-lg text-xs font-black uppercase tracking-wider border border-emerald-500/20">
                                 <span className="flex items-center gap-1.5">
                                   <Check size={14} /> Active on Live Floor
@@ -995,7 +1169,7 @@ export default function GTADashboard() {
                               <div className="flex items-center gap-2">
                                 <button
                                   type="button"
-                                  disabled={!canExtend30m || isExtendingThis}
+                                  disabled={!canExtend30m || isBusyThis}
                                   onClick={() => handleExtendActiveSession(b, 0.5, bufferMins)}
                                   className="flex-1 bg-[#1A2235] text-[#00D0FF] hover:bg-[#00D0FF] hover:text-black disabled:opacity-30 disabled:pointer-events-none py-2 rounded-lg text-xs font-black border border-[#2D3748] transition-all"
                                   title={
@@ -1004,11 +1178,11 @@ export default function GTADashboard() {
                                       : 'Less than 30m buffer before next slot'
                                   }
                                 >
-                                  {isExtendingThis ? 'Updating...' : '+30m Extend (+₹100)'}
+                                  {isBusyThis ? 'Updating...' : '+30m Extend (+₹100)'}
                                 </button>
                                 <button
                                   type="button"
-                                  disabled={!canExtend1h || isExtendingThis}
+                                  disabled={!canExtend1h || isBusyThis}
                                   onClick={() => handleExtendActiveSession(b, 1, bufferMins)}
                                   className="flex-1 bg-[#1A2235] text-emerald-400 hover:bg-emerald-500 hover:text-white disabled:opacity-30 disabled:pointer-events-none py-2 rounded-lg text-xs font-black border border-[#2D3748] transition-all"
                                   title={
@@ -1017,7 +1191,7 @@ export default function GTADashboard() {
                                       : 'Less than 1h buffer before next slot'
                                   }
                                 >
-                                  {isExtendingThis ? 'Updating...' : '+1h Extend (+₹150)'}
+                                  {isBusyThis ? 'Updating...' : '+1h Extend (+₹150)'}
                                 </button>
                               </div>
                             </div>
@@ -1043,7 +1217,7 @@ export default function GTADashboard() {
                               </div>
                             </div>
                           ) : (
-                            <div className="mt-3 pt-3 border-t border-[#1E293B] flex flex-wrap gap-2">
+                            <div className="mt-2 pt-2.5 border-t border-[#1E293B] flex flex-wrap gap-2">
                               <button
                                 onClick={() => {
                                   setSelectedBooking(b);
@@ -1077,7 +1251,7 @@ export default function GTADashboard() {
                               <button
                                 onClick={() => openEditModal(b)}
                                 className="bg-[#1A2235] text-gray-400 px-2.5 py-2 rounded-lg hover:text-white transition-all border border-[#2D3748]"
-                                title="Edit"
+                                title="Edit or Swap Slot"
                               >
                                 <Edit2 size={14} />
                               </button>
@@ -1194,11 +1368,42 @@ export default function GTADashboard() {
             {modal === 'booking' && (
               <>
                 <div className="bg-[#0B0E14] p-4 border-b border-[#1E293B] flex justify-between items-center">
-                  <h2 className="text-lg font-black text-white">{selectedBooking ? 'Edit Booking' : 'New GTA Booking'}</h2>
+                  <h2 className="text-lg font-black text-white">{selectedBooking ? 'Edit / Swap Booking' : 'New GTA Booking'}</h2>
                   <button onClick={() => setModal(null)} className="text-gray-400 hover:text-white transition-colors p-1"><X size={18} /></button>
                 </div>
 
                 <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto custom-scrollbar">
+                  {/* Direct Atomic Slot Swap (Visible when editing an existing booking) */}
+                  {selectedBooking && swappableBookings.length > 0 && (
+                    <div className="bg-[#0B0E14] border border-[#00D0FF]/30 rounded-xl p-3 space-y-2">
+                      <label className="text-[10px] text-[#00D0FF] font-black uppercase tracking-wider flex items-center gap-1.5">
+                        <ArrowLeftRight size={12} /> Direct Swap Console & Time With Another Booking
+                      </label>
+                      <div className="flex gap-2">
+                        <select
+                          className="flex-1 bg-[#121824] p-2.5 text-xs rounded-lg border border-[#2D3748] focus:border-[#00D0FF] outline-none text-white font-bold"
+                          value={swapTargetId}
+                          onChange={(e) => setSwapTargetId(e.target.value)}
+                        >
+                          <option value="">Select booking to swap with...</option>
+                          {swappableBookings.map((sb) => (
+                            <option key={sb.id} value={sb.id}>
+                              {sb.system_id} • {sb.start_time} ({sb.duration}h) – {sb.customer_name}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          disabled={!swapTargetId || isProcessing}
+                          onClick={handleSwapBookings}
+                          className="bg-[#00D0FF] text-black px-3.5 py-2 rounded-lg text-xs font-black disabled:opacity-30 hover:bg-white transition-all whitespace-nowrap"
+                        >
+                          Swap
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">Console</label>
