@@ -118,21 +118,36 @@ const buildWhatsAppText = (b: Booking) => {
   return `Dear *${b.customer_name}*,\n\nThank you for choosing Gamerarena! Your exclusive GTA VI slot has been successfully secured. Here are your booking details:\n\n📅 *Date:* ${niceDate}\n⏰ *Start Time:* ${b.start_time}\n⏳ *Duration:* ${b.duration} Hours\n🎮 *Console:* ${b.system_id}\n\n*⚠️ House Rules for Launch Week:*\n• *10-Minute Grace Period:* If you arrive more than 10 minutes late, your slot may be reassigned to the next waiting player.\n• *Hard Stops:* To ensure everyone gets their turn, sessions must end strictly on time if another gamer is scheduled after you.\n\nSee you at the arena! 🎮`;
 };
 
-const getAvailableSlots1HrPlus = (sysBookings: Booking[]): TimeWindow[] => {
+const getAvailableSlots1HrPlus = (
+  sysBookings: Booking[],
+  selectedDate: string,
+  istNow: { dateStr: string; currentMinutes: number }
+): TimeWindow[] => {
+  if (selectedDate < istNow.dateStr) return [];
+
+  // If viewing today, start checking from current IST time (rounded up to next 5 mins)
+  const roundedNow = Math.ceil(istNow.currentMinutes / 5) * 5;
+  const startBoundary =
+    selectedDate === istNow.dateStr
+      ? Math.max(OPENING_MINS, roundedNow)
+      : OPENING_MINS;
+
+  if (startBoundary >= CLOSING_MINS) return [];
+
   const blocks = sysBookings
     .map((b) => {
       const start = timeToMinutes(b.start_time);
       const end = start + Number(b.duration) * 60;
       return { start, end };
     })
-    .filter((block) => block.end > OPENING_MINS && block.start < CLOSING_MINS)
+    .filter((block) => block.end > startBoundary && block.start < CLOSING_MINS)
     .sort((a, b) => a.start - b.start);
 
   const windows: TimeWindow[] = [];
-  let cursor = OPENING_MINS;
+  let cursor = startBoundary;
 
   for (const block of blocks) {
-    const effectiveStart = Math.max(cursor, OPENING_MINS);
+    const effectiveStart = Math.max(cursor, startBoundary);
     const effectiveEnd = Math.min(block.start, CLOSING_MINS);
 
     if (effectiveEnd - effectiveStart >= MIN_SLOT_MINS) {
@@ -489,7 +504,7 @@ export default function GTADashboard() {
               <h1 className="text-2xl font-black uppercase tracking-wide flex items-center gap-2">
                 GTA VI x <span className="text-[#00D0FF]">Gamerarena</span>
               </h1>
-              <p className="text-gray-500 text-[10px] font-bold tracking-widest uppercase mt-0.5">Pre-Booking Management • 10 AM – 12 AM (1h+ Slots)</p>
+              <p className="text-gray-500 text-[10px] font-bold tracking-widest uppercase mt-0.5">Pre-Booking Management • Upcoming 1h+ Slots (Till 12 AM)</p>
             </div>
 
             <div className="flex w-full sm:w-auto items-center gap-3">
@@ -503,10 +518,14 @@ export default function GTADashboard() {
             </div>
           </div>
 
-          {/* OPEN SLOTS STRIP (10 AM - 12 AM Midnight, Minimum 1 Hour) */}
+          {/* OPEN SLOTS STRIP (Upcoming Only, Till 12 AM Midnight, Minimum 1 Hour) */}
           <div className="pt-3 border-t border-[#1E293B] grid grid-cols-1 md:grid-cols-3 gap-2.5">
             {SYSTEMS.map((sys) => {
-              const openWindows = getAvailableSlots1HrPlus(bookings.filter((b) => b.system_id === sys));
+              const openWindows = getAvailableSlots1HrPlus(
+                bookings.filter((b) => b.system_id === sys),
+                dateFilter,
+                nowTick
+              );
               return (
                 <div key={sys} className="bg-[#0B0E14] border border-[#2D3748] rounded-xl px-3 py-2 flex items-center gap-2.5 min-w-0">
                   <span className="text-xs font-black text-[#00D0FF] bg-[#00D0FF]/10 px-2 py-0.5 rounded shrink-0">
@@ -514,7 +533,7 @@ export default function GTADashboard() {
                   </span>
                   <div className="flex flex-wrap gap-1.5 min-w-0">
                     {openWindows.length === 0 ? (
-                      <span className="text-[11px] font-bold text-red-400">No 1h+ slots</span>
+                      <span className="text-[11px] font-bold text-red-400">No 1h+ slots left</span>
                     ) : (
                       openWindows.map((win, idx) => (
                         <span
