@@ -1,13 +1,35 @@
 'use client'
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { supabase } from './supabaseClient';
-import { Calendar, Monitor, User, Phone, Plus, Minus, AlertTriangle, ShieldCheck, Check, Trash2, Edit2, Rocket, Lock, X, MessageCircle, CheckCircle2, Timer, Clock } from 'lucide-react';
+import {
+  Calendar,
+  Monitor,
+  User,
+  Phone,
+  Plus,
+  Minus,
+  AlertTriangle,
+  ShieldCheck,
+  Check,
+  Trash2,
+  Edit2,
+  Rocket,
+  Lock,
+  X,
+  MessageCircle,
+  CheckCircle2,
+  Timer,
+  Clock,
+  RefreshCw,
+  UserX,
+  ExternalLink,
+} from 'lucide-react';
 
 const SYSTEMS = ['PS1', 'PS2', 'PS3'];
 const OPENING_MINS = 600; // 10:00 AM
 const CLOSING_MINS = 1440; // 12:00 AM (Midnight)
-const MIN_SLOT_MINS = 60; // Ignore gaps under 1 hour (such as 30-min gaps)
+const MIN_SLOT_MINS = 60; // Ignore gaps under 1 hour
 
 type Booking = {
   id: number;
@@ -30,6 +52,8 @@ type TimeWindow = {
   start: number;
   end: number;
 };
+
+type StatusFilter = 'All' | 'Upcoming' | 'Pushed' | 'No-Show';
 
 // --- Helper Functions ---
 const timeToMinutes = (timeStr: string) => {
@@ -59,6 +83,13 @@ const minutesTo12Hour = (mins: number) => {
   const ampm = h24 >= 12 ? 'PM' : 'AM';
   const h12 = h24 % 12 || 12;
   return `${h12.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')} ${ampm}`;
+};
+
+const minutesTo24Hour = (mins: number) => {
+  const clamped = Math.max(0, Math.min(1439, Math.round(mins)));
+  const h24 = Math.floor(clamped / 60);
+  const m = clamped % 60;
+  return `${h24.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
 };
 
 const format12Hour = (time24: string) => {
@@ -103,8 +134,8 @@ const getTodayString = () => getISTParts().dateStr;
 // Calculates base cost for PS5
 const getPrice = (dur: number, extra: number = 0) => {
   const full = Math.floor(dur);
-  const half = (dur % 1 !== 0) ? 1 : 0;
-  return (full * (150 + (extra * 100))) + (half * (100 + (extra * 100)));
+  const half = dur % 1 !== 0 ? 1 : 0;
+  return full * (150 + extra * 100) + half * (100 + extra * 100);
 };
 
 const buildWhatsAppText = (b: Booking) => {
@@ -116,6 +147,15 @@ const buildWhatsAppText = (b: Booking) => {
   const niceDate = `${d} ${dateObj.toLocaleString('en-US', { month: 'short' })} ${y}`;
 
   return `Dear *${b.customer_name}*,\n\nThank you for choosing Gamerarena! Your exclusive GTA VI slot has been successfully secured. Here are your booking details:\n\n📅 *Date:* ${niceDate}\n⏰ *Start Time:* ${b.start_time}\n⏳ *Duration:* ${b.duration} Hours\n🎮 *Console:* ${b.system_id}\n\n*⚠️ House Rules for Launch Week:*\n• *10-Minute Grace Period:* If you arrive more than 10 minutes late, your slot may be reassigned to the next waiting player.\n• *Hard Stops:* To ensure everyone gets their turn, sessions must end strictly on time if another gamer is scheduled after you.\n\nSee you at the arena! 🎮`;
+};
+
+const buildWhatsAppUrl = (b: Booking) => {
+  const digits = (b.phone_number || '').replace(/\D/g, '');
+  const formattedPhone = digits.length === 10 ? `91${digits}` : digits;
+  const encodedText = encodeURIComponent(buildWhatsAppText(b));
+  return formattedPhone
+    ? `https://wa.me/${formattedPhone}?text=${encodedText}`
+    : `https://wa.me/?text=${encodedText}`;
 };
 
 const getAvailableSlots1HrPlus = (
@@ -134,9 +174,9 @@ const getAvailableSlots1HrPlus = (
 
   if (startBoundary >= CLOSING_MINS) return [];
 
-  // Strictly only use bookings belonging to selectedDate
+  // Exclude No-Show bookings so their time windows become available again
   const blocks = sysBookings
-    .filter((b) => b.booking_date === selectedDate)
+    .filter((b) => b.booking_date === selectedDate && b.status !== 'No-Show')
     .map((b) => {
       const start = timeToMinutes(b.start_time);
       const end = start + Number(b.duration) * 60;
@@ -172,7 +212,9 @@ export default function GTADashboard() {
 
   // Automatically snaps to current IST date on load
   const [dateFilter, setDateFilter] = useState(() => getTodayString());
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('All');
   const [bookings, setBookings] = useState<Booking[]>([]);
+  const [activeSales, setActiveSales] = useState<ActiveSale[]>([]);
   const [loadedDate, setLoadedDate] = useState<string>('');
   const [isFetching, setIsFetching] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -195,7 +237,7 @@ export default function GTADashboard() {
     document.title = 'Booking x Gamerarena';
   }, []);
 
-  const fetchBookings = async (targetDate: string, silent = false) => {
+  const fetchBookings = useCallback(async (targetDate: string, silent = false) => {
     if (!targetDate) return;
     if (!silent) setIsFetching(true);
     try {
@@ -206,13 +248,14 @@ export default function GTADashboard() {
 
       if (bookingsRes.error) throw bookingsRes.error;
 
-      const activeSales = (salesRes.data || []) as ActiveSale[];
+      const currentActiveSales = (salesRes.data || []) as ActiveSale[];
       const rawBookings = (bookingsRes.data || []) as Booking[];
+      setActiveSales(currentActiveSales);
 
       // Auto-hide bookings that were Pushed to Live Floor once closed in POS
       const visibleBookings = rawBookings.filter((b) => {
         if (b.status !== 'Pushed') return true;
-        const stillActiveOnFloor = activeSales.some(
+        const stillActiveOnFloor = currentActiveSales.some(
           (s) =>
             s.system === b.system_id &&
             s.customer.trim().toLowerCase() === b.customer_name.trim().toLowerCase()
@@ -226,13 +269,13 @@ export default function GTADashboard() {
       setBookings(sorted);
       setLoadedDate(targetDate);
     } catch (err) {
-      console.error("Fetch error:", err);
+      console.error('Fetch error:', err);
     } finally {
       if (!silent) setIsFetching(false);
     }
-  };
+  }, []);
 
-  // Live clock tick & silent POS sync every 15 seconds
+  // Live clock tick & fallback sync every 15 seconds
   useEffect(() => {
     const interval = setInterval(() => {
       setNowTick(getISTParts());
@@ -241,8 +284,34 @@ export default function GTADashboard() {
       }
     }, 15000);
     return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dateFilter, isAuthenticated]);
+  }, [dateFilter, isAuthenticated, fetchBookings]);
+
+  // Instant Supabase Realtime sync across staff devices & POS checkouts
+  useEffect(() => {
+    if (!isAuthenticated || !dateFilter) return;
+
+    const channel = supabase
+      .channel(`gta-dashboard-${dateFilter}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'gta_bookings' },
+        () => {
+          fetchBookings(dateFilter, true);
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'sales' },
+        () => {
+          fetchBookings(dateFilter, true);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [dateFilter, isAuthenticated, fetchBookings]);
 
   // Fetch bookings immediately when date changes or after login
   useEffect(() => {
@@ -250,8 +319,7 @@ export default function GTADashboard() {
       setBookings([]);
       fetchBookings(dateFilter, false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dateFilter, isAuthenticated]);
+  }, [dateFilter, isAuthenticated, fetchBookings]);
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -262,11 +330,11 @@ export default function GTADashboard() {
     }
   };
 
-  const openCreateModal = () => {
+  const openCreateModal = (presetSystem?: string, presetStartMins?: number) => {
     setSelectedBooking(null);
-    setFormSystem('PS1');
+    setFormSystem(presetSystem || 'PS1');
     setFormDate(dateFilter);
-    setStartTime24('');
+    setStartTime24(presetStartMins !== undefined ? minutesTo24Hour(presetStartMins) : '');
     setDuration(2);
     setName('');
     setPhone('');
@@ -279,7 +347,7 @@ export default function GTADashboard() {
     setFormDate(b.booking_date);
     setName(b.customer_name);
     setPhone(b.phone_number);
-    setDuration(Number(b.duration));
+    setDuration(Math.max(1, Number(b.duration)));
 
     // Reverse engineer 12h to 24h for the time input safely
     const parts = b.start_time.trim().split(/\s+/);
@@ -297,32 +365,33 @@ export default function GTADashboard() {
     setModal('booking');
   };
 
-  // Smart Collision Logic for Modal
+  // Smart Collision Logic for Modal (ignores No-Show bookings)
   let isOverlapping = false;
   let overlapWarning = '';
 
-  if (startTime24 && duration > 0 && modal === 'booking') {
+  if (startTime24 && duration >= 1 && modal === 'booking') {
     const newStart = timeToMinutes(startTime24);
-    const newEnd = newStart + (duration * 60);
+    const newEnd = newStart + duration * 60;
 
-    const conflict = bookings.find(b => {
+    const conflict = bookings.find((b) => {
+      if (b.status === 'No-Show') return false;
       if (selectedBooking && b.id === selectedBooking.id) return false;
       if (b.system_id !== formSystem || b.booking_date !== formDate) return false;
 
       const bStart = timeToMinutes(b.start_time);
-      const bEnd = bStart + (Number(b.duration) * 60);
+      const bEnd = bStart + Number(b.duration) * 60;
       return newStart < bEnd && newEnd > bStart;
     });
 
     if (conflict) {
       isOverlapping = true;
-      overlapWarning = `Overlaps with ${conflict.customer_name} (${conflict.start_time})`;
+      overlapWarning = `Overlaps with ${conflict.customer_name} (${conflict.start_time} – ${minutesTo12Hour(timeToMinutes(conflict.start_time) + Number(conflict.duration) * 60)})`;
     }
   }
 
   const handleSaveBooking = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (isProcessing || isOverlapping || !startTime24 || !name || phone.length < 10) return;
+    if (isProcessing || isOverlapping || !startTime24 || duration < 1 || !name.trim() || phone.trim().length < 10) return;
     setIsProcessing(true);
 
     const time12 = format12Hour(startTime24);
@@ -333,7 +402,7 @@ export default function GTADashboard() {
       booking_date: formDate,
       start_time: time12,
       duration: duration,
-      status: 'Locked'
+      status: selectedBooking?.status === 'Pushed' ? 'Pushed' : 'Locked',
     };
 
     try {
@@ -376,8 +445,43 @@ export default function GTADashboard() {
     }
   };
 
+  const handleMarkNoShow = async (b: Booking) => {
+    if (!window.confirm(`Mark ${b.customer_name} as No-Show? This will release their ${b.start_time} slot on ${b.system_id}.`)) return;
+    setIsProcessing(true);
+    try {
+      const { error } = await supabase
+        .from('gta_bookings')
+        .update({ status: 'No-Show' })
+        .eq('id', b.id);
+      if (error) throw error;
+      await fetchBookings(dateFilter);
+    } catch (err) {
+      console.error(err);
+      alert('Error updating status.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleRestoreBooking = async (b: Booking) => {
+    setIsProcessing(true);
+    try {
+      const { error } = await supabase
+        .from('gta_bookings')
+        .update({ status: 'Locked' })
+        .eq('id', b.id);
+      if (error) throw error;
+      await fetchBookings(dateFilter);
+    } catch (err) {
+      console.error(err);
+      alert('Error restoring booking.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const handleDelete = async (id: number) => {
-    if (!window.confirm("Are you sure you want to delete this booking?")) return;
+    if (!window.confirm('Are you sure you want to delete this booking?')) return;
     setIsProcessing(true);
     await supabase.from('gta_bookings').delete().eq('id', id);
     await fetchBookings(dateFilter);
@@ -400,19 +504,40 @@ export default function GTADashboard() {
     const totalCost = getPrice(selectedBooking.duration, 0);
 
     try {
+      // Check if an Active session is already running on that console in POS
+      const { data: existingActive } = await supabase
+        .from('sales')
+        .select('customer, system')
+        .eq('date', today)
+        .eq('system', selectedBooking.system_id)
+        .eq('status', 'Active');
+
+      if (existingActive && existingActive.length > 0) {
+        const runningGamer = existingActive[0].customer;
+        const proceed = window.confirm(
+          `⚠️ ${selectedBooking.system_id} already has an Active session (${runningGamer}) on the Live Floor.\n\nDo you still want to push ${selectedBooking.customer_name} to ${selectedBooking.system_id}?`
+        );
+        if (!proceed) {
+          setIsProcessing(false);
+          return;
+        }
+      }
+
       // 1. Inject into live POS
-      const { error: liveError } = await supabase.from('sales').insert([{
-        customer: selectedBooking.customer_name,
-        system: selectedBooking.system_id,
-        duration: selectedBooking.duration,
-        total: totalCost,
-        status: 'Active',
-        entry_time: entryTime,
-        date: today,
-        fnb_total: 0,
-        method: 'Pending',
-        fnb_items: ""
-      }]);
+      const { error: liveError } = await supabase.from('sales').insert([
+        {
+          customer: selectedBooking.customer_name,
+          system: selectedBooking.system_id,
+          duration: selectedBooking.duration,
+          total: totalCost,
+          status: 'Active',
+          entry_time: entryTime,
+          date: today,
+          fnb_total: 0,
+          method: 'Pending',
+          fnb_items: '',
+        },
+      ]);
 
       if (liveError) throw liveError;
 
@@ -424,14 +549,14 @@ export default function GTADashboard() {
       alert(`Success! ${selectedBooking.customer_name} is now ACTIVE on the Live Floor.`);
     } catch (err) {
       console.error(err);
-      alert("Error pushing to live floor.");
+      alert('Error pushing to live floor.');
     } finally {
       setIsProcessing(false);
     }
   };
 
   const copyWhatsAppMessage = async (b: Booking) => {
-    const freshBooking = bookings.find(item => item.id === b.id) || b;
+    const freshBooking = bookings.find((item) => item.id === b.id) || b;
     const text = buildWhatsAppText(freshBooking);
 
     try {
@@ -449,12 +574,12 @@ export default function GTADashboard() {
 
     setCopiedId(freshBooking.id);
     setTimeout(() => {
-      setCopiedId(prev => (prev === freshBooking.id ? null : prev));
+      setCopiedId((prev) => (prev === freshBooking.id ? null : prev));
     }, 2500);
   };
 
   const getCountdownInfo = (b: Booking) => {
-    if (b.status === 'Pushed' || b.booking_date !== nowTick.dateStr) {
+    if (b.status === 'Pushed' || b.status === 'No-Show' || b.booking_date !== nowTick.dateStr) {
       return { label: null, isUrgent30Min: false };
     }
 
@@ -462,7 +587,11 @@ export default function GTADashboard() {
     const diffMins = startMins - nowTick.currentMinutes;
 
     if (diffMins < 0) {
-      return { label: 'Slot time reached', isUrgent30Min: false };
+      const lateMins = Math.abs(diffMins);
+      return {
+        label: lateMins > 10 ? `Late by ${lateMins}m (>10m grace)` : `Started ${lateMins}m ago`,
+        isUrgent30Min: lateMins > 10,
+      };
     }
 
     if (diffMins === 0) {
@@ -482,9 +611,25 @@ export default function GTADashboard() {
     };
   };
 
-  // Bookings strictly matching the active dateFilter
+  // Bookings strictly matching the active dateFilter (excluding No-Show from total booked hours)
   const activeDateBookings = bookings.filter((b) => b.booking_date === dateFilter);
-  const totalBookedHours = activeDateBookings.reduce((sum, b) => sum + Number(b.duration || 0), 0);
+  const validBookedSlots = activeDateBookings.filter((b) => b.status !== 'No-Show');
+  const totalBookedHours = validBookedSlots.reduce((sum, b) => sum + Number(b.duration || 0), 0);
+
+  // Open windows for the currently selected console/date in the booking modal
+  const modalOpenWindows =
+    modal === 'booking' && formDate
+      ? getAvailableSlots1HrPlus(
+          bookings.filter(
+            (b) =>
+              b.system_id === formSystem &&
+              b.booking_date === formDate &&
+              (!selectedBooking || b.id !== selectedBooking.id)
+          ),
+          formDate,
+          nowTick
+        )
+      : [];
 
   if (!isAuthenticated) {
     return (
@@ -493,7 +638,7 @@ export default function GTADashboard() {
           <div className="flex justify-center mb-6"><Lock size={40} className="text-[#00D0FF]" /></div>
           <h2 className="text-2xl font-black mb-1">Booking x Gamerarena</h2>
           <p className="text-gray-500 text-xs font-bold uppercase tracking-widest mb-6">Staff Access Only</p>
-          <input type="password" placeholder="Enter PIN" className="w-full bg-[#0B0E14] p-4 text-center rounded-xl border border-[#2D3748] focus:border-[#00D0FF] outline-none font-bold tracking-widest mb-4" value={password} onChange={e => setPassword(e.target.value)} />
+          <input type="password" placeholder="Enter PIN" className="w-full bg-[#0B0E14] p-4 text-center rounded-xl border border-[#2D3748] focus:border-[#00D0FF] outline-none font-bold tracking-widest mb-4" value={password} onChange={(e) => setPassword(e.target.value)} />
           <button type="submit" className="w-full bg-[#00D0FF] text-black py-4 rounded-xl font-black hover:bg-white transition-all shadow-[0_0_15px_rgba(0,208,255,0.2)]">Unlock Dashboard</button>
         </form>
       </div>
@@ -502,26 +647,30 @@ export default function GTADashboard() {
 
   return (
     <>
-      <style dangerouslySetInnerHTML={{
-        __html: `
+      <style
+        dangerouslySetInnerHTML={{
+          __html: `
         @import url('https://fonts.googleapis.com/css2?family=Lato:wght@400;700;900&display=swap');
         * { font-family: 'Lato', sans-serif; }
         .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
         .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
         .custom-scrollbar::-webkit-scrollbar-thumb { background: #1E293B; border-radius: 10px; }
-      `}} />
+      `,
+        }}
+      />
 
       <div className="min-h-screen bg-[#05070A] text-white p-4 sm:p-6 lg:h-screen lg:flex lg:flex-col lg:overflow-hidden">
-
         {/* HEADER BAR */}
         <div className="flex flex-col gap-3 mb-6 shrink-0 bg-[#121824] p-4 rounded-2xl border border-[#1E293B]">
-          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+          <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
             <div className="flex flex-wrap items-center gap-3">
               <div>
                 <h1 className="text-2xl font-black uppercase tracking-wide flex items-center gap-2">
                   Booking x <span className="text-[#00D0FF]">Gamerarena</span>
                 </h1>
-                <p className="text-gray-500 text-[10px] font-bold tracking-widest uppercase mt-0.5">Pre-Booking Management • 1h+ Slots (10 AM – 12 AM)</p>
+                <p className="text-gray-500 text-[10px] font-bold tracking-widest uppercase mt-0.5">
+                  Pre-Booking Management • 1h+ Slots (10 AM – 12 AM)
+                </p>
               </div>
 
               <div className="bg-[#0B0E14] border border-[#00D0FF]/30 px-3.5 py-2 rounded-xl flex items-center gap-2">
@@ -533,19 +682,49 @@ export default function GTADashboard() {
               </div>
             </div>
 
-            <div className="flex w-full sm:w-auto items-center gap-3">
+            <div className="flex flex-wrap w-full lg:w-auto items-center gap-2.5">
+              {/* Status Filter Pills */}
+              <div className="flex items-center bg-[#0B0E14] p-1 rounded-xl border border-[#2D3748]">
+                {(['All', 'Upcoming', 'Pushed', 'No-Show'] as StatusFilter[]).map((tab) => (
+                  <button
+                    key={tab}
+                    onClick={() => setStatusFilter(tab)}
+                    className={`px-2.5 py-1.5 rounded-lg text-[11px] font-black transition-all ${
+                      statusFilter === tab
+                        ? 'bg-[#00D0FF] text-black'
+                        : 'text-gray-400 hover:text-white'
+                    }`}
+                  >
+                    {tab === 'Pushed' ? 'Live' : tab}
+                  </button>
+                ))}
+              </div>
+
               <div className="flex items-center bg-[#0B0E14] px-3 py-2 rounded-xl border border-[#2D3748]">
                 <Calendar size={14} className="text-[#00D0FF] mr-2" />
                 <input
                   type="date"
                   className="bg-transparent outline-none text-sm font-bold [color-scheme:dark]"
                   value={dateFilter}
-                  onChange={e => {
+                  onChange={(e) => {
                     if (e.target.value) setDateFilter(e.target.value);
                   }}
                 />
               </div>
-              <button onClick={openCreateModal} className="bg-gradient-to-r from-pink-500 via-purple-500 to-[#00D0FF] text-white px-5 py-2.5 rounded-xl font-black text-sm hover:opacity-90 transition-all shadow-sm flex items-center gap-2 whitespace-nowrap">
+
+              <button
+                onClick={() => fetchBookings(dateFilter, false)}
+                disabled={isFetching}
+                className="bg-[#0B0E14] text-gray-300 hover:text-[#00D0FF] p-2.5 rounded-xl border border-[#2D3748] transition-all"
+                title="Refresh Bookings & POS Sync"
+              >
+                <RefreshCw size={16} className={isFetching ? 'animate-spin text-[#00D0FF]' : ''} />
+              </button>
+
+              <button
+                onClick={() => openCreateModal()}
+                className="bg-gradient-to-r from-pink-500 via-purple-500 to-[#00D0FF] text-white px-5 py-2.5 rounded-xl font-black text-sm hover:opacity-90 transition-all shadow-sm flex items-center gap-2 whitespace-nowrap"
+              >
                 <Plus size={16} /> New Entry
               </button>
             </div>
@@ -562,12 +741,18 @@ export default function GTADashboard() {
                     nowTick
                   )
                 : [];
+              const hasActiveFloorSession = activeSales.some((s) => s.system === sys);
 
               return (
                 <div key={sys} className="bg-[#0B0E14] border border-[#2D3748] rounded-xl px-3 py-2 flex items-center gap-2.5 min-w-0">
-                  <span className="text-xs font-black text-[#00D0FF] bg-[#00D0FF]/10 px-2 py-0.5 rounded shrink-0">
-                    {sys}
-                  </span>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <span className="text-xs font-black text-[#00D0FF] bg-[#00D0FF]/10 px-2 py-0.5 rounded">
+                      {sys}
+                    </span>
+                    {hasActiveFloorSession && (
+                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" title="Active session on Live Floor" />
+                    )}
+                  </div>
                   <div className="flex flex-wrap gap-1.5 min-w-0">
                     {!isDateSynced ? (
                       <span className="text-[11px] font-bold text-gray-500">Checking slots...</span>
@@ -575,12 +760,15 @@ export default function GTADashboard() {
                       <span className="text-[11px] font-bold text-red-400">No 1h+ slots left</span>
                     ) : (
                       openWindows.map((win, idx) => (
-                        <span
+                        <button
                           key={idx}
-                          className="text-[11px] font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded whitespace-nowrap"
+                          type="button"
+                          onClick={() => openCreateModal(sys, win.start)}
+                          className="text-[11px] font-bold text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/25 border border-emerald-500/20 px-2 py-0.5 rounded whitespace-nowrap transition-all"
+                          title={`Click to book ${sys} at ${minutesTo12Hour(win.start)}`}
                         >
                           {minutesTo12Hour(win.start)} – {minutesTo12Hour(win.end)}
-                        </span>
+                        </button>
                       ))
                     )}
                   </div>
@@ -592,9 +780,19 @@ export default function GTADashboard() {
 
         {/* KANBAN BOARD */}
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-6 lg:min-h-0 overflow-y-auto lg:overflow-hidden">
-          {SYSTEMS.map(sys => {
-            const sysBookings = activeDateBookings.filter(b => b.system_id === sys);
-            const sysHours = sysBookings.reduce((sum, b) => sum + Number(b.duration || 0), 0);
+          {SYSTEMS.map((sys) => {
+            const allSysBookings = activeDateBookings.filter((b) => b.system_id === sys);
+            const activeSysBookings = allSysBookings.filter((b) => b.status !== 'No-Show');
+            const sysHours = activeSysBookings.reduce((sum, b) => sum + Number(b.duration || 0), 0);
+
+            const filteredSysBookings = allSysBookings.filter((b) => {
+              if (statusFilter === 'All') return true;
+              if (statusFilter === 'Upcoming') return b.status === 'Locked';
+              if (statusFilter === 'Pushed') return b.status === 'Pushed';
+              if (statusFilter === 'No-Show') return b.status === 'No-Show';
+              return true;
+            });
+
             return (
               <div key={sys} className="bg-[#121824] border border-[#1E293B] rounded-2xl flex flex-col overflow-hidden lg:h-full">
                 {/* Column Header */}
@@ -603,7 +801,7 @@ export default function GTADashboard() {
                     <Monitor size={18} className="text-[#00D0FF]" /> {sys}
                   </h2>
                   <span className="text-xs font-bold text-gray-400 bg-[#1A2235] px-2.5 py-1 rounded">
-                    {sysBookings.length} Slots • {sysHours}h
+                    {activeSysBookings.length} Slots • {sysHours}h
                   </span>
                 </div>
 
@@ -611,24 +809,36 @@ export default function GTADashboard() {
                 <div className="p-4 flex-1 overflow-y-auto custom-scrollbar space-y-4">
                   {isFetching ? (
                     <p className="text-center text-xs text-gray-500 font-bold mt-10">Loading...</p>
-                  ) : sysBookings.length === 0 ? (
+                  ) : filteredSysBookings.length === 0 ? (
                     <div className="text-center mt-10 border border-dashed border-[#2D3748] rounded-xl p-6">
                       <p className="text-gray-500 text-xs font-bold uppercase tracking-widest">No Bookings</p>
                     </div>
                   ) : (
-                    sysBookings.map(b => {
+                    filteredSysBookings.map((b) => {
                       const countdown = getCountdownInfo(b);
                       const isCopied = copiedId === b.id;
+                      const startMins = timeToMinutes(b.start_time);
+                      const endMins = startMins + Number(b.duration) * 60;
+                      const endTimeFormatted = minutesTo12Hour(endMins);
+
+                      // Check if another active booking on the same system starts immediately at endMins (Hard Stop)
+                      const hasBackToBackNext =
+                        b.status !== 'No-Show' &&
+                        activeSysBookings.some(
+                          (other) => other.id !== b.id && timeToMinutes(other.start_time) === endMins
+                        );
 
                       return (
                         <div
                           key={b.id}
                           className={`border rounded-xl p-4 transition-all ${
-                            b.status === 'Pushed'
-                              ? 'bg-[#0B0E14] border-emerald-500/30 opacity-70'
-                              : countdown.isUrgent30Min
-                                ? 'bg-red-950/35 border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.2)]'
-                                : 'bg-[#0B0E14] border-[#2D3748] hover:border-[#00D0FF]/40'
+                            b.status === 'No-Show'
+                              ? 'bg-[#0B0E14]/60 border-gray-800 opacity-55'
+                              : b.status === 'Pushed'
+                                ? 'bg-[#0B0E14] border-emerald-500/30 opacity-80'
+                                : countdown.isUrgent30Min
+                                  ? 'bg-red-950/35 border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.2)]'
+                                  : 'bg-[#0B0E14] border-[#2D3748] hover:border-[#00D0FF]/40'
                           }`}
                         >
                           <div className="flex justify-between items-start mb-3">
@@ -639,20 +849,29 @@ export default function GTADashboard() {
                             <div className="text-right shrink-0">
                               <p
                                 className={`text-xs font-black px-2 py-1 rounded ${
-                                  b.status === 'Pushed'
-                                    ? 'bg-emerald-500/10 text-emerald-400'
-                                    : countdown.isUrgent30Min
-                                      ? 'bg-red-500/20 text-red-400 border border-red-500/40'
-                                      : 'bg-[#00D0FF]/10 text-[#00D0FF]'
+                                  b.status === 'No-Show'
+                                    ? 'bg-gray-800 text-gray-400'
+                                    : b.status === 'Pushed'
+                                      ? 'bg-emerald-500/10 text-emerald-400'
+                                      : countdown.isUrgent30Min
+                                        ? 'bg-red-500/20 text-red-400 border border-red-500/40'
+                                        : 'bg-[#00D0FF]/10 text-[#00D0FF]'
                                 }`}
                               >
-                                {b.start_time}
+                                {b.start_time} – {endTimeFormatted}
                               </p>
                               <p className="text-gray-500 text-[10px] font-bold uppercase mt-1.5">{b.duration}h Block</p>
                             </div>
                           </div>
 
-                          {countdown.label && b.status !== 'Pushed' && (
+                          {hasBackToBackNext && (
+                            <div className="mb-2.5 px-2.5 py-1 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[10px] font-black uppercase tracking-wider flex items-center gap-1.5">
+                              <AlertTriangle size={12} className="text-amber-400 shrink-0" />
+                              Hard Stop at {endTimeFormatted} (Next Slot Back-to-Back)
+                            </div>
+                          )}
+
+                          {countdown.label && b.status === 'Locked' && (
                             <div
                               className={`mb-3 px-2.5 py-1.5 rounded-lg text-[11px] font-black uppercase tracking-wider flex items-center justify-between ${
                                 countdown.isUrgent30Min
@@ -672,14 +891,50 @@ export default function GTADashboard() {
                             <div className="mt-3 flex items-center justify-center gap-1.5 bg-emerald-500/10 text-emerald-500 py-2 rounded-lg text-xs font-black uppercase tracking-widest border border-emerald-500/20">
                               <Check size={14} /> Active on Live Floor
                             </div>
+                          ) : b.status === 'No-Show' ? (
+                            <div className="mt-3 pt-3 border-t border-[#1E293B] flex items-center justify-between gap-2">
+                              <span className="text-[11px] font-black uppercase tracking-wider text-gray-400 flex items-center gap-1.5">
+                                <UserX size={13} className="text-red-400" /> Marked No-Show
+                              </span>
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={() => handleRestoreBooking(b)}
+                                  className="bg-[#1A2235] text-[#00D0FF] px-3 py-1.5 rounded-lg text-xs font-black hover:bg-white hover:text-black transition-all border border-[#2D3748]"
+                                >
+                                  Restore
+                                </button>
+                                <button
+                                  onClick={() => handleDelete(b.id)}
+                                  className="bg-[#1A2235] text-gray-400 px-2.5 py-1.5 rounded-lg hover:text-red-400 hover:border-red-400 transition-all border border-[#2D3748]"
+                                  title="Delete"
+                                >
+                                  <Trash2 size={14} />
+                                </button>
+                              </div>
+                            </div>
                           ) : (
-                            <div className="mt-3 pt-3 border-t border-[#1E293B] flex gap-2">
-                              <button onClick={() => { setSelectedBooking(b); setModal('push'); }} className="flex-1 bg-emerald-500 text-white py-2 rounded-lg text-xs font-black hover:bg-emerald-400 transition-all flex items-center justify-center gap-1.5 shadow-[0_0_10px_rgba(16,185,129,0.2)]">
+                            <div className="mt-3 pt-3 border-t border-[#1E293B] flex flex-wrap gap-2">
+                              <button
+                                onClick={() => {
+                                  setSelectedBooking(b);
+                                  setModal('push');
+                                }}
+                                className="flex-1 min-w-[115px] bg-emerald-500 text-white py-2 rounded-lg text-xs font-black hover:bg-emerald-400 transition-all flex items-center justify-center gap-1.5 shadow-[0_0_10px_rgba(16,185,129,0.2)]"
+                              >
                                 <Rocket size={14} /> Push to Live
                               </button>
+                              <a
+                                href={buildWhatsAppUrl(b)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="bg-[#1A2235] text-emerald-400 px-2.5 py-2 rounded-lg hover:bg-emerald-500 hover:text-white transition-all border border-[#2D3748] flex items-center justify-center"
+                                title="Send Directly on WhatsApp"
+                              >
+                                <ExternalLink size={14} />
+                              </a>
                               <button
                                 onClick={() => copyWhatsAppMessage(b)}
-                                className={`px-3 py-2 rounded-lg transition-all border flex items-center gap-1 text-xs font-bold ${
+                                className={`px-2.5 py-2 rounded-lg transition-all border flex items-center gap-1 text-xs font-bold ${
                                   isCopied
                                     ? 'bg-emerald-500 text-white border-emerald-400'
                                     : 'bg-[#1A2235] text-[#00D0FF] hover:bg-white hover:text-black border-[#2D3748]'
@@ -689,10 +944,25 @@ export default function GTADashboard() {
                                 {isCopied ? <Check size={14} /> : <MessageCircle size={14} />}
                                 {isCopied && <span>Copied</span>}
                               </button>
-                              <button onClick={() => openEditModal(b)} className="bg-[#1A2235] text-gray-400 px-3 py-2 rounded-lg hover:text-white transition-all border border-[#2D3748]" title="Edit">
+                              <button
+                                onClick={() => openEditModal(b)}
+                                className="bg-[#1A2235] text-gray-400 px-2.5 py-2 rounded-lg hover:text-white transition-all border border-[#2D3748]"
+                                title="Edit"
+                              >
                                 <Edit2 size={14} />
                               </button>
-                              <button onClick={() => handleDelete(b.id)} className="bg-[#1A2235] text-gray-400 px-3 py-2 rounded-lg hover:text-red-400 hover:border-red-400 transition-all border border-[#2D3748]" title="Cancel">
+                              <button
+                                onClick={() => handleMarkNoShow(b)}
+                                className="bg-[#1A2235] text-gray-400 px-2.5 py-2 rounded-lg hover:text-amber-400 hover:border-amber-400 transition-all border border-[#2D3748]"
+                                title="Mark No-Show (Release Slot)"
+                              >
+                                <UserX size={14} />
+                              </button>
+                              <button
+                                onClick={() => handleDelete(b.id)}
+                                className="bg-[#1A2235] text-gray-400 px-2.5 py-2 rounded-lg hover:text-red-400 hover:border-red-400 transition-all border border-[#2D3748]"
+                                title="Delete"
+                              >
                                 <Trash2 size={14} />
                               </button>
                             </div>
@@ -712,31 +982,46 @@ export default function GTADashboard() {
       {modal && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-[#121824] border border-[#1E293B] rounded-2xl w-full max-w-md overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200">
-
             {/* Modal: WhatsApp Confirmation Popup on New/Edit Booking */}
             {modal === 'whatsapp' && selectedBooking && (
               <div className="p-6 text-center">
                 <CheckCircle2 size={50} className="text-[#00D0FF] mx-auto mb-4" />
                 <h2 className="text-xl font-black mb-2">Slot Locked Successfully!</h2>
-                <p className="text-gray-400 text-xs mb-6">Click below to copy the updated WhatsApp confirmation message for <strong>{selectedBooking.customer_name}</strong>.</p>
+                <p className="text-gray-400 text-xs mb-6">
+                  Send or copy the updated WhatsApp confirmation for <strong>{selectedBooking.customer_name}</strong>.
+                </p>
 
                 <div className="bg-[#0B0E14] border border-[#2D3748] rounded-xl p-4 text-left mb-6 space-y-1">
                   <p className="text-white text-xs font-bold">📅 Date: {selectedBooking.booking_date}</p>
-                  <p className="text-[#00D0FF] text-xs font-black">⏰ Time: {selectedBooking.start_time} ({selectedBooking.duration}h)</p>
+                  <p className="text-[#00D0FF] text-xs font-black">
+                    ⏰ Time: {selectedBooking.start_time} – {minutesTo12Hour(timeToMinutes(selectedBooking.start_time) + Number(selectedBooking.duration) * 60)} ({selectedBooking.duration}h)
+                  </p>
                   <p className="text-gray-400 text-xs font-bold">🎮 Console: {selectedBooking.system_id}</p>
                 </div>
 
                 <div className="flex flex-col gap-3">
+                  <a
+                    href={buildWhatsAppUrl(selectedBooking)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={() => setModal(null)}
+                    className="w-full bg-emerald-500 text-white py-3.5 rounded-xl font-black hover:bg-emerald-400 transition-all flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(16,185,129,0.3)] text-sm"
+                  >
+                    <ExternalLink size={16} /> Send Directly on WhatsApp
+                  </a>
                   <button
                     onClick={async () => {
                       await copyWhatsAppMessage(selectedBooking);
                       setModal(null);
                     }}
-                    className="w-full bg-emerald-500 text-white py-3.5 rounded-xl font-black hover:bg-emerald-400 transition-all flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(16,185,129,0.3)] text-sm"
+                    className="w-full bg-[#0B0E14] text-[#00D0FF] py-3.5 rounded-xl font-black border border-[#00D0FF]/40 hover:bg-[#00D0FF] hover:text-black transition-all flex items-center justify-center gap-2 text-sm"
                   >
-                    <MessageCircle size={16} /> Copy WhatsApp Message
+                    <MessageCircle size={16} /> Copy WhatsApp Text
                   </button>
-                  <button onClick={() => setModal(null)} className="w-full bg-[#1A2235] text-white py-3.5 rounded-xl font-bold border border-[#2D3748] hover:bg-gray-700 transition-all text-sm">
+                  <button
+                    onClick={() => setModal(null)}
+                    className="w-full bg-[#1A2235] text-white py-3 rounded-xl font-bold border border-[#2D3748] hover:bg-gray-700 transition-all text-sm"
+                  >
                     Close / Done
                   </button>
                 </div>
@@ -748,11 +1033,19 @@ export default function GTADashboard() {
               <div className="p-6">
                 <div className="flex justify-center mb-4"><Rocket size={40} className="text-emerald-400" /></div>
                 <h2 className="text-xl font-black text-center mb-2">Send to Live Floor?</h2>
-                <p className="text-gray-400 text-sm text-center mb-6">This will instantly start an Active session for <strong>{selectedBooking.customer_name}</strong> on <strong>{selectedBooking.system_id}</strong> in your main POS.</p>
+                <p className="text-gray-400 text-sm text-center mb-6">
+                  This will instantly start an Active session for <strong>{selectedBooking.customer_name}</strong> on <strong>{selectedBooking.system_id}</strong> in your main POS.
+                </p>
 
                 <div className="bg-[#0B0E14] border border-[#2D3748] rounded-xl p-4 mb-6">
-                  <div className="flex justify-between text-sm mb-2"><span className="text-gray-500 font-bold">Duration</span><span className="text-white font-black">{selectedBooking.duration} Hours</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-500 font-bold">Base Cost</span><span className="text-emerald-400 font-black">₹{getPrice(selectedBooking.duration, 0)}</span></div>
+                  <div className="flex justify-between text-sm mb-2">
+                    <span className="text-gray-500 font-bold">Duration</span>
+                    <span className="text-white font-black">{selectedBooking.duration} Hours</span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-gray-500 font-bold">Base Cost</span>
+                    <span className="text-emerald-400 font-black">₹{getPrice(selectedBooking.duration, 0)}</span>
+                  </div>
                 </div>
 
                 <div className="flex gap-3">
@@ -773,38 +1066,103 @@ export default function GTADashboard() {
                 </div>
 
                 <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto custom-scrollbar">
-
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">Console</label>
-                      <select className="w-full bg-[#0B0E14] p-3 text-sm rounded-xl border border-[#2D3748] focus:border-[#00D0FF] outline-none text-white font-bold" value={formSystem} onChange={(e) => setFormSystem(e.target.value)}>
-                        {SYSTEMS.map(sys => <option key={sys} value={sys}>{sys}</option>)}
+                      <select
+                        className="w-full bg-[#0B0E14] p-3 text-sm rounded-xl border border-[#2D3748] focus:border-[#00D0FF] outline-none text-white font-bold"
+                        value={formSystem}
+                        onChange={(e) => setFormSystem(e.target.value)}
+                      >
+                        {SYSTEMS.map((sys) => (
+                          <option key={sys} value={sys}>{sys}</option>
+                        ))}
                       </select>
                     </div>
                     <div>
                       <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">Date</label>
-                      <input type="date" className="w-full bg-[#0B0E14] p-3 text-sm rounded-xl border border-[#2D3748] focus:border-[#00D0FF] outline-none text-white [color-scheme:dark] font-bold" value={formDate} onChange={(e) => setFormDate(e.target.value)} />
+                      <input
+                        type="date"
+                        className="w-full bg-[#0B0E14] p-3 text-sm rounded-xl border border-[#2D3748] focus:border-[#00D0FF] outline-none text-white [color-scheme:dark] font-bold"
+                        value={formDate}
+                        onChange={(e) => setFormDate(e.target.value)}
+                      />
                     </div>
                   </div>
+
+                  {/* Quick-Tap Open Slots for Selected Console & Date */}
+                  {modalOpenWindows.length > 0 && (
+                    <div>
+                      <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">
+                        Quick-Fill Free Slot ({formSystem})
+                      </label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {modalOpenWindows.map((win, idx) => (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => setStartTime24(minutesTo24Hour(win.start))}
+                            className="text-[11px] font-bold text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/25 border border-emerald-500/30 px-2.5 py-1 rounded-lg transition-all"
+                          >
+                            Start {minutesTo12Hour(win.start)} (until {minutesTo12Hour(win.end)})
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">Start Time</label>
-                      <input type="time" className="w-full bg-[#0B0E14] p-3 text-sm rounded-xl border border-[#2D3748] focus:border-[#00D0FF] outline-none text-white [color-scheme:dark] font-bold" value={startTime24} onChange={(e) => setStartTime24(e.target.value)} />
+                      <input
+                        type="time"
+                        className="w-full bg-[#0B0E14] p-3 text-sm rounded-xl border border-[#2D3748] focus:border-[#00D0FF] outline-none text-white [color-scheme:dark] font-bold"
+                        value={startTime24}
+                        onChange={(e) => setStartTime24(e.target.value)}
+                      />
                     </div>
                     <div>
-                      <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">Duration</label>
+                      <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">Duration (Min 1h)</label>
                       <div className="flex justify-between items-center bg-[#0B0E14] mt-0.5 p-2 rounded-xl border border-[#2D3748]">
-                        <button type="button" onClick={() => setDuration(Math.max(0.5, duration - 0.5))} className="p-1.5 hover:text-[#00D0FF] bg-[#1A2235] rounded-lg"><Minus size={14} /></button>
+                        <button
+                          type="button"
+                          onClick={() => setDuration(Math.max(1, duration - 0.5))}
+                          className="p-1.5 hover:text-[#00D0FF] bg-[#1A2235] rounded-lg"
+                        >
+                          <Minus size={14} />
+                        </button>
                         <span className="font-bold text-sm">{duration}h</span>
-                        <button type="button" onClick={() => setDuration(duration + 0.5)} className="p-1.5 hover:text-[#00D0FF] bg-[#1A2235] rounded-lg"><Plus size={14} /></button>
+                        <button
+                          type="button"
+                          onClick={() => setDuration(duration + 0.5)}
+                          className="p-1.5 hover:text-[#00D0FF] bg-[#1A2235] rounded-lg"
+                        >
+                          <Plus size={14} />
+                        </button>
                       </div>
                     </div>
                   </div>
 
                   {startTime24 && (
-                    <div className={`p-3 rounded-xl border text-xs font-bold flex items-start gap-2 transition-all ${isOverlapping ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'}`}>
-                      {isOverlapping ? <><AlertTriangle size={14} className="shrink-0 mt-0.5" /> <span>{overlapWarning}</span></> : <><ShieldCheck size={14} className="shrink-0 mt-0.5" /> <span>Time clear.</span></>}
+                    <div
+                      className={`p-3 rounded-xl border text-xs font-bold flex items-start gap-2 transition-all ${
+                        isOverlapping
+                          ? 'bg-red-500/10 border-red-500/30 text-red-400'
+                          : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                      }`}
+                    >
+                      {isOverlapping ? (
+                        <>
+                          <AlertTriangle size={14} className="shrink-0 mt-0.5" /> <span>{overlapWarning}</span>
+                        </>
+                      ) : (
+                        <>
+                          <ShieldCheck size={14} className="shrink-0 mt-0.5" />
+                          <span>
+                            Time clear ({format12Hour(startTime24)} – {minutesTo12Hour(timeToMinutes(startTime24) + duration * 60)}).
+                          </span>
+                        </>
+                      )}
                     </div>
                   )}
 
@@ -812,7 +1170,13 @@ export default function GTADashboard() {
                     <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">Gamer Name</label>
                     <div className="flex items-center bg-[#0B0E14] rounded-xl border border-[#2D3748] px-3 focus-within:border-[#00D0FF]">
                       <User size={16} className="text-gray-500 shrink-0" />
-                      <input type="text" className="w-full bg-transparent p-3 text-sm outline-none font-bold placeholder-gray-700" placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} />
+                      <input
+                        type="text"
+                        className="w-full bg-transparent p-3 text-sm outline-none font-bold placeholder-gray-700"
+                        placeholder="Name"
+                        value={name}
+                        onChange={(e) => setName(e.target.value)}
+                      />
                     </div>
                   </div>
 
@@ -820,23 +1184,33 @@ export default function GTADashboard() {
                     <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">Phone</label>
                     <div className="flex items-center bg-[#0B0E14] rounded-xl border border-[#2D3748] px-3 focus-within:border-[#00D0FF]">
                       <Phone size={16} className="text-gray-500 shrink-0" />
-                      <input type="tel" maxLength={10} className="w-full bg-transparent p-3 text-sm outline-none font-bold placeholder-gray-700" placeholder="10-Digit Number" value={phone} onChange={(e) => setPhone(e.target.value)} />
+                      <input
+                        type="tel"
+                        maxLength={10}
+                        className="w-full bg-transparent p-3 text-sm outline-none font-bold placeholder-gray-700"
+                        placeholder="10-Digit Number"
+                        value={phone}
+                        onChange={(e) => setPhone(e.target.value)}
+                      />
                     </div>
                   </div>
 
                   <div className="pt-4">
-                    <button type="button" onClick={handleSaveBooking} disabled={isProcessing || isOverlapping || !startTime24 || !name || phone.length < 10} className="w-full bg-[#00D0FF] text-black py-4 rounded-xl font-black text-sm disabled:opacity-30 hover:bg-white transition-all shadow-[0_0_15px_rgba(0,208,255,0.2)]">
-                      {isProcessing ? 'Saving...' : (selectedBooking ? 'Save Changes' : 'Lock Slot')}
+                    <button
+                      type="button"
+                      onClick={handleSaveBooking}
+                      disabled={isProcessing || isOverlapping || !startTime24 || duration < 1 || !name.trim() || phone.trim().length < 10}
+                      className="w-full bg-[#00D0FF] text-black py-4 rounded-xl font-black text-sm disabled:opacity-30 hover:bg-white transition-all shadow-[0_0_15px_rgba(0,208,255,0.2)]"
+                    >
+                      {isProcessing ? 'Saving...' : selectedBooking ? 'Save Changes' : 'Lock Slot'}
                     </button>
                   </div>
                 </div>
               </>
             )}
-
           </div>
         </div>
       )}
-
     </>
   );
 }
