@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
-import { Calendar, Monitor, User, Phone, Plus, Minus, AlertTriangle, ShieldCheck, Check, Trash2, Edit2, Rocket, Lock, X, MessageCircle, CheckCircle2, Timer } from 'lucide-react';
+import { Calendar, Monitor, User, Phone, Plus, Minus, AlertTriangle, ShieldCheck, Check, Trash2, Edit2, Rocket, Lock, X, MessageCircle, CheckCircle2, Timer, Clock } from 'lucide-react';
 
 const SYSTEMS = ['PS1', 'PS2', 'PS3'];
 const OPENING_MINS = 600; // 10:00 AM
@@ -123,9 +123,9 @@ const getAvailableSlots1HrPlus = (
   selectedDate: string,
   istNow: { dateStr: string; currentMinutes: number }
 ): TimeWindow[] => {
-  if (selectedDate < istNow.dateStr) return [];
+  if (!selectedDate || selectedDate < istNow.dateStr) return [];
 
-  // If viewing today, start checking from current IST time (rounded up to next 5 mins)
+  // Only clip past times if selectedDate is TODAY in IST; future dates always start at 10:00 AM
   const roundedNow = Math.ceil(istNow.currentMinutes / 5) * 5;
   const startBoundary =
     selectedDate === istNow.dateStr
@@ -134,7 +134,9 @@ const getAvailableSlots1HrPlus = (
 
   if (startBoundary >= CLOSING_MINS) return [];
 
+  // Strictly only use bookings belonging to selectedDate
   const blocks = sysBookings
+    .filter((b) => b.booking_date === selectedDate)
     .map((b) => {
       const start = timeToMinutes(b.start_time);
       const end = start + Number(b.duration) * 60;
@@ -171,6 +173,7 @@ export default function GTADashboard() {
   // Automatically snaps to current IST date on load
   const [dateFilter, setDateFilter] = useState(() => getTodayString());
   const [bookings, setBookings] = useState<Booking[]>([]);
+  const [loadedDate, setLoadedDate] = useState<string>('');
   const [isFetching, setIsFetching] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [copiedId, setCopiedId] = useState<number | null>(null);
@@ -188,12 +191,17 @@ export default function GTADashboard() {
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
 
-  const fetchBookings = async (silent = false) => {
+  useEffect(() => {
+    document.title = 'Booking x Gamerarena';
+  }, []);
+
+  const fetchBookings = async (targetDate: string, silent = false) => {
+    if (!targetDate) return;
     if (!silent) setIsFetching(true);
     try {
       const [bookingsRes, salesRes] = await Promise.all([
-        supabase.from('gta_bookings').select('*').eq('booking_date', dateFilter),
-        supabase.from('sales').select('customer, system, status').eq('date', dateFilter).eq('status', 'Active'),
+        supabase.from('gta_bookings').select('*').eq('booking_date', targetDate),
+        supabase.from('sales').select('customer, system, status').eq('date', targetDate).eq('status', 'Active'),
       ]);
 
       if (bookingsRes.error) throw bookingsRes.error;
@@ -216,6 +224,7 @@ export default function GTADashboard() {
         (a: Booking, b: Booking) => timeToMinutes(a.start_time) - timeToMinutes(b.start_time)
       );
       setBookings(sorted);
+      setLoadedDate(targetDate);
     } catch (err) {
       console.error("Fetch error:", err);
     } finally {
@@ -227,17 +236,20 @@ export default function GTADashboard() {
   useEffect(() => {
     const interval = setInterval(() => {
       setNowTick(getISTParts());
-      if (isAuthenticated) {
-        fetchBookings(true);
+      if (isAuthenticated && dateFilter) {
+        fetchBookings(dateFilter, true);
       }
     }, 15000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dateFilter, isAuthenticated]);
 
-  // Fetch bookings when date changes or after login
+  // Fetch bookings immediately when date changes or after login
   useEffect(() => {
-    if (isAuthenticated) fetchBookings();
+    if (isAuthenticated && dateFilter) {
+      setBookings([]);
+      fetchBookings(dateFilter, false);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dateFilter, isAuthenticated]);
 
@@ -349,7 +361,7 @@ export default function GTADashboard() {
       if (formDate !== dateFilter) {
         setDateFilter(formDate);
       } else {
-        await fetchBookings();
+        await fetchBookings(dateFilter);
       }
 
       if (savedRecord) {
@@ -368,7 +380,7 @@ export default function GTADashboard() {
     if (!window.confirm("Are you sure you want to delete this booking?")) return;
     setIsProcessing(true);
     await supabase.from('gta_bookings').delete().eq('id', id);
-    await fetchBookings();
+    await fetchBookings(dateFilter);
     setIsProcessing(false);
   };
 
@@ -408,7 +420,7 @@ export default function GTADashboard() {
       await supabase.from('gta_bookings').update({ status: 'Pushed' }).eq('id', selectedBooking.id);
 
       setModal(null);
-      await fetchBookings();
+      await fetchBookings(dateFilter);
       alert(`Success! ${selectedBooking.customer_name} is now ACTIVE on the Live Floor.`);
     } catch (err) {
       console.error(err);
@@ -470,12 +482,16 @@ export default function GTADashboard() {
     };
   };
 
+  // Bookings strictly matching the active dateFilter
+  const activeDateBookings = bookings.filter((b) => b.booking_date === dateFilter);
+  const totalBookedHours = activeDateBookings.reduce((sum, b) => sum + Number(b.duration || 0), 0);
+
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen flex bg-[#05070A] text-white items-center justify-center p-4" style={{ fontFamily: 'Lato, sans-serif' }}>
         <form onSubmit={handleLogin} className="bg-[#121824] p-8 rounded-3xl border border-[#1E293B] shadow-2xl w-full max-w-sm text-center">
           <div className="flex justify-center mb-6"><Lock size={40} className="text-[#00D0FF]" /></div>
-          <h2 className="text-2xl font-black mb-1">GTA VI x Gamerarena</h2>
+          <h2 className="text-2xl font-black mb-1">Booking x Gamerarena</h2>
           <p className="text-gray-500 text-xs font-bold uppercase tracking-widest mb-6">Staff Access Only</p>
           <input type="password" placeholder="Enter PIN" className="w-full bg-[#0B0E14] p-4 text-center rounded-xl border border-[#2D3748] focus:border-[#00D0FF] outline-none font-bold tracking-widest mb-4" value={password} onChange={e => setPassword(e.target.value)} />
           <button type="submit" className="w-full bg-[#00D0FF] text-black py-4 rounded-xl font-black hover:bg-white transition-all shadow-[0_0_15px_rgba(0,208,255,0.2)]">Unlock Dashboard</button>
@@ -500,17 +516,34 @@ export default function GTADashboard() {
         {/* HEADER BAR */}
         <div className="flex flex-col gap-3 mb-6 shrink-0 bg-[#121824] p-4 rounded-2xl border border-[#1E293B]">
           <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-            <div>
-              <h1 className="text-2xl font-black uppercase tracking-wide flex items-center gap-2">
-                GTA VI x <span className="text-[#00D0FF]">Gamerarena</span>
-              </h1>
-              <p className="text-gray-500 text-[10px] font-bold tracking-widest uppercase mt-0.5">Pre-Booking Management • Upcoming 1h+ Slots (Till 12 AM)</p>
+            <div className="flex flex-wrap items-center gap-3">
+              <div>
+                <h1 className="text-2xl font-black uppercase tracking-wide flex items-center gap-2">
+                  Booking x <span className="text-[#00D0FF]">Gamerarena</span>
+                </h1>
+                <p className="text-gray-500 text-[10px] font-bold tracking-widest uppercase mt-0.5">Pre-Booking Management • 1h+ Slots (10 AM – 12 AM)</p>
+              </div>
+
+              <div className="bg-[#0B0E14] border border-[#00D0FF]/30 px-3.5 py-2 rounded-xl flex items-center gap-2">
+                <Clock size={15} className="text-[#00D0FF]" />
+                <div>
+                  <p className="text-[9px] text-gray-500 font-bold uppercase tracking-wider leading-none">Total Booked</p>
+                  <p className="text-sm font-black text-white mt-0.5 leading-none">{totalBookedHours} hrs</p>
+                </div>
+              </div>
             </div>
 
             <div className="flex w-full sm:w-auto items-center gap-3">
               <div className="flex items-center bg-[#0B0E14] px-3 py-2 rounded-xl border border-[#2D3748]">
                 <Calendar size={14} className="text-[#00D0FF] mr-2" />
-                <input type="date" className="bg-transparent outline-none text-sm font-bold [color-scheme:dark]" value={dateFilter} onChange={e => setDateFilter(e.target.value)} />
+                <input
+                  type="date"
+                  className="bg-transparent outline-none text-sm font-bold [color-scheme:dark]"
+                  value={dateFilter}
+                  onChange={e => {
+                    if (e.target.value) setDateFilter(e.target.value);
+                  }}
+                />
               </div>
               <button onClick={openCreateModal} className="bg-gradient-to-r from-pink-500 via-purple-500 to-[#00D0FF] text-white px-5 py-2.5 rounded-xl font-black text-sm hover:opacity-90 transition-all shadow-sm flex items-center gap-2 whitespace-nowrap">
                 <Plus size={16} /> New Entry
@@ -518,21 +551,27 @@ export default function GTADashboard() {
             </div>
           </div>
 
-          {/* OPEN SLOTS STRIP (Upcoming Only, Till 12 AM Midnight, Minimum 1 Hour) */}
+          {/* OPEN SLOTS STRIP (Selected Date Only, 10 AM - 12 AM Midnight, Minimum 1 Hour) */}
           <div className="pt-3 border-t border-[#1E293B] grid grid-cols-1 md:grid-cols-3 gap-2.5">
             {SYSTEMS.map((sys) => {
-              const openWindows = getAvailableSlots1HrPlus(
-                bookings.filter((b) => b.system_id === sys),
-                dateFilter,
-                nowTick
-              );
+              const isDateSynced = loadedDate === dateFilter && !isFetching;
+              const openWindows = isDateSynced
+                ? getAvailableSlots1HrPlus(
+                    activeDateBookings.filter((b) => b.system_id === sys),
+                    dateFilter,
+                    nowTick
+                  )
+                : [];
+
               return (
                 <div key={sys} className="bg-[#0B0E14] border border-[#2D3748] rounded-xl px-3 py-2 flex items-center gap-2.5 min-w-0">
                   <span className="text-xs font-black text-[#00D0FF] bg-[#00D0FF]/10 px-2 py-0.5 rounded shrink-0">
                     {sys}
                   </span>
                   <div className="flex flex-wrap gap-1.5 min-w-0">
-                    {openWindows.length === 0 ? (
+                    {!isDateSynced ? (
+                      <span className="text-[11px] font-bold text-gray-500">Checking slots...</span>
+                    ) : openWindows.length === 0 ? (
                       <span className="text-[11px] font-bold text-red-400">No 1h+ slots left</span>
                     ) : (
                       openWindows.map((win, idx) => (
@@ -554,7 +593,8 @@ export default function GTADashboard() {
         {/* KANBAN BOARD */}
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-6 lg:min-h-0 overflow-y-auto lg:overflow-hidden">
           {SYSTEMS.map(sys => {
-            const sysBookings = bookings.filter(b => b.system_id === sys);
+            const sysBookings = activeDateBookings.filter(b => b.system_id === sys);
+            const sysHours = sysBookings.reduce((sum, b) => sum + Number(b.duration || 0), 0);
             return (
               <div key={sys} className="bg-[#121824] border border-[#1E293B] rounded-2xl flex flex-col overflow-hidden lg:h-full">
                 {/* Column Header */}
@@ -562,7 +602,9 @@ export default function GTADashboard() {
                   <h2 className="text-lg font-black text-white flex items-center gap-2">
                     <Monitor size={18} className="text-[#00D0FF]" /> {sys}
                   </h2>
-                  <span className="text-xs font-bold text-gray-500 bg-[#1A2235] px-2 py-1 rounded">{sysBookings.length} Slots</span>
+                  <span className="text-xs font-bold text-gray-400 bg-[#1A2235] px-2.5 py-1 rounded">
+                    {sysBookings.length} Slots • {sysHours}h
+                  </span>
                 </div>
 
                 {/* Cards Area */}
