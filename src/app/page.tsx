@@ -5,6 +5,9 @@ import { supabase } from './supabaseClient';
 import { Calendar, Monitor, User, Phone, Plus, Minus, AlertTriangle, ShieldCheck, Check, Trash2, Edit2, Rocket, Lock, X, MessageCircle, CheckCircle2, Timer } from 'lucide-react';
 
 const SYSTEMS = ['PS1', 'PS2', 'PS3'];
+const OPENING_MINS = 600; // 10:00 AM
+const CLOSING_MINS = 1440; // 12:00 AM (Midnight)
+const MIN_SLOT_MINS = 60; // Ignore gaps under 1 hour (such as 30-min gaps)
 
 type Booking = {
   id: number;
@@ -21,6 +24,11 @@ type ActiveSale = {
   customer: string;
   system: string;
   status: string;
+};
+
+type TimeWindow = {
+  start: number;
+  end: number;
 };
 
 // --- Helper Functions ---
@@ -41,6 +49,16 @@ const timeToMinutes = (timeStr: string) => {
   }
   const parts24 = timeStr.split(':').map(Number);
   return parts24[0] * 60 + parts24[1];
+};
+
+const minutesTo12Hour = (mins: number) => {
+  const clamped = Math.max(0, Math.min(1440, Math.round(mins)));
+  if (clamped === 1440) return '12:00 AM';
+  const h24 = Math.floor(clamped / 60);
+  const m = clamped % 60;
+  const ampm = h24 >= 12 ? 'PM' : 'AM';
+  const h12 = h24 % 12 || 12;
+  return `${h12.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')} ${ampm}`;
 };
 
 const format12Hour = (time24: string) => {
@@ -98,6 +116,37 @@ const buildWhatsAppText = (b: Booking) => {
   const niceDate = `${d} ${dateObj.toLocaleString('en-US', { month: 'short' })} ${y}`;
 
   return `Dear *${b.customer_name}*,\n\nThank you for choosing Gamerarena! Your exclusive GTA VI slot has been successfully secured. Here are your booking details:\n\n📅 *Date:* ${niceDate}\n⏰ *Start Time:* ${b.start_time}\n⏳ *Duration:* ${b.duration} Hours\n🎮 *Console:* ${b.system_id}\n\n*⚠️ House Rules for Launch Week:*\n• *10-Minute Grace Period:* If you arrive more than 10 minutes late, your slot may be reassigned to the next waiting player.\n• *Hard Stops:* To ensure everyone gets their turn, sessions must end strictly on time if another gamer is scheduled after you.\n\nSee you at the arena! 🎮`;
+};
+
+const getAvailableSlots1HrPlus = (sysBookings: Booking[]): TimeWindow[] => {
+  const blocks = sysBookings
+    .map((b) => {
+      const start = timeToMinutes(b.start_time);
+      const end = start + Number(b.duration) * 60;
+      return { start, end };
+    })
+    .filter((block) => block.end > OPENING_MINS && block.start < CLOSING_MINS)
+    .sort((a, b) => a.start - b.start);
+
+  const windows: TimeWindow[] = [];
+  let cursor = OPENING_MINS;
+
+  for (const block of blocks) {
+    const effectiveStart = Math.max(cursor, OPENING_MINS);
+    const effectiveEnd = Math.min(block.start, CLOSING_MINS);
+
+    if (effectiveEnd - effectiveStart >= MIN_SLOT_MINS) {
+      windows.push({ start: effectiveStart, end: effectiveEnd });
+    }
+
+    cursor = Math.max(cursor, Math.min(block.end, CLOSING_MINS));
+  }
+
+  if (CLOSING_MINS - cursor >= MIN_SLOT_MINS) {
+    windows.push({ start: cursor, end: CLOSING_MINS });
+  }
+
+  return windows;
 };
 
 export default function GTADashboard() {
@@ -434,22 +483,52 @@ export default function GTADashboard() {
       <div className="min-h-screen bg-[#05070A] text-white p-4 sm:p-6 lg:h-screen lg:flex lg:flex-col lg:overflow-hidden">
 
         {/* HEADER BAR */}
-        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6 shrink-0 bg-[#121824] p-4 rounded-2xl border border-[#1E293B]">
-          <div>
-            <h1 className="text-2xl font-black uppercase tracking-wide flex items-center gap-2">
-              GTA VI x <span className="text-[#00D0FF]">Gamerarena</span>
-            </h1>
-            <p className="text-gray-500 text-[10px] font-bold tracking-widest uppercase mt-0.5">Pre-Booking Management</p>
+        <div className="flex flex-col gap-3 mb-6 shrink-0 bg-[#121824] p-4 rounded-2xl border border-[#1E293B]">
+          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+            <div>
+              <h1 className="text-2xl font-black uppercase tracking-wide flex items-center gap-2">
+                GTA VI x <span className="text-[#00D0FF]">Gamerarena</span>
+              </h1>
+              <p className="text-gray-500 text-[10px] font-bold tracking-widest uppercase mt-0.5">Pre-Booking Management • 10 AM – 12 AM (1h+ Slots)</p>
+            </div>
+
+            <div className="flex w-full sm:w-auto items-center gap-3">
+              <div className="flex items-center bg-[#0B0E14] px-3 py-2 rounded-xl border border-[#2D3748]">
+                <Calendar size={14} className="text-[#00D0FF] mr-2" />
+                <input type="date" className="bg-transparent outline-none text-sm font-bold [color-scheme:dark]" value={dateFilter} onChange={e => setDateFilter(e.target.value)} />
+              </div>
+              <button onClick={openCreateModal} className="bg-gradient-to-r from-pink-500 via-purple-500 to-[#00D0FF] text-white px-5 py-2.5 rounded-xl font-black text-sm hover:opacity-90 transition-all shadow-sm flex items-center gap-2 whitespace-nowrap">
+                <Plus size={16} /> New Entry
+              </button>
+            </div>
           </div>
 
-          <div className="flex w-full sm:w-auto items-center gap-3">
-            <div className="flex items-center bg-[#0B0E14] px-3 py-2 rounded-xl border border-[#2D3748]">
-              <Calendar size={14} className="text-[#00D0FF] mr-2" />
-              <input type="date" className="bg-transparent outline-none text-sm font-bold [color-scheme:dark]" value={dateFilter} onChange={e => setDateFilter(e.target.value)} />
-            </div>
-            <button onClick={openCreateModal} className="bg-gradient-to-r from-pink-500 via-purple-500 to-[#00D0FF] text-white px-5 py-2.5 rounded-xl font-black text-sm hover:opacity-90 transition-all shadow-sm flex items-center gap-2 whitespace-nowrap">
-              <Plus size={16} /> New Entry
-            </button>
+          {/* OPEN SLOTS STRIP (10 AM - 12 AM Midnight, Minimum 1 Hour) */}
+          <div className="pt-3 border-t border-[#1E293B] grid grid-cols-1 md:grid-cols-3 gap-2.5">
+            {SYSTEMS.map((sys) => {
+              const openWindows = getAvailableSlots1HrPlus(bookings.filter((b) => b.system_id === sys));
+              return (
+                <div key={sys} className="bg-[#0B0E14] border border-[#2D3748] rounded-xl px-3 py-2 flex items-center gap-2.5 min-w-0">
+                  <span className="text-xs font-black text-[#00D0FF] bg-[#00D0FF]/10 px-2 py-0.5 rounded shrink-0">
+                    {sys}
+                  </span>
+                  <div className="flex flex-wrap gap-1.5 min-w-0">
+                    {openWindows.length === 0 ? (
+                      <span className="text-[11px] font-bold text-red-400">No 1h+ slots</span>
+                    ) : (
+                      openWindows.map((win, idx) => (
+                        <span
+                          key={idx}
+                          className="text-[11px] font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded whitespace-nowrap"
+                        >
+                          {minutesTo12Hour(win.start)} – {minutesTo12Hour(win.end)}
+                        </span>
+                      ))
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
 
