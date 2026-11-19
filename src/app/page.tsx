@@ -261,18 +261,8 @@ export default function GTADashboard() {
       const rawBookings = (bookingsRes.data || []) as Booking[];
       setActiveSales(currentActiveSales);
 
-      // Auto-hide bookings that were Pushed to Live Floor once closed in POS
-      const visibleBookings = rawBookings.filter((b) => {
-        if (b.status !== 'Pushed') return true;
-        const stillActiveOnFloor = currentActiveSales.some(
-          (s) =>
-            s.system === b.system_id &&
-            s.customer.trim().toLowerCase() === b.customer_name.trim().toLowerCase()
-        );
-        return stillActiveOnFloor;
-      });
-
-      const sorted = visibleBookings.sort(
+      // Keep all bookings for cumulative booked-hours totals; Kanban board filters out closed POS sessions
+      const sorted = rawBookings.sort(
         (a: Booking, b: Booking) => timeToMinutes(a.start_time) - timeToMinutes(b.start_time)
       );
       setBookings(sorted);
@@ -693,14 +683,25 @@ export default function GTADashboard() {
     };
   };
 
+  // All valid bookings for the selected date (never reduced when a pushed session ends in POS)
   const activeDateBookings = bookings.filter((b) => b.booking_date === dateFilter);
   const validBookedSlots = activeDateBookings.filter((b) => b.status !== 'No-Show');
   const totalBookedHours = validBookedSlots.reduce((sum, b) => sum + Number(b.duration || 0), 0);
 
+  // Kanban card list hides completed Pushed sessions once they are no longer Active in POS
+  const kanbanBookings = activeDateBookings.filter((b) => {
+    if (b.status !== 'Pushed') return true;
+    return activeSales.some(
+      (s) =>
+        s.system === b.system_id &&
+        s.customer.trim().toLowerCase() === b.customer_name.trim().toLowerCase()
+    );
+  });
+
   const modalOpenWindows =
     modal === 'booking' && formDate
       ? getAvailableSlots1HrPlus(
-          bookings.filter(
+          kanbanBookings.filter(
             (b) =>
               b.system_id === formSystem &&
               b.booking_date === formDate &&
@@ -816,7 +817,7 @@ export default function GTADashboard() {
               const isDateSynced = loadedDate === dateFilter && !isFetching;
               const openWindows = isDateSynced
                 ? getAvailableSlots1HrPlus(
-                    activeDateBookings.filter((b) => b.system_id === sys),
+                    kanbanBookings.filter((b) => b.system_id === sys),
                     dateFilter,
                     nowTick
                   )
@@ -861,11 +862,15 @@ export default function GTADashboard() {
         {/* KANBAN BOARD */}
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-6 lg:min-h-0 overflow-y-auto lg:overflow-hidden">
           {SYSTEMS.map((sys) => {
-            const allSysBookings = activeDateBookings.filter((b) => b.system_id === sys);
-            const activeSysBookings = allSysBookings.filter((b) => b.status !== 'No-Show');
-            const sysHours = activeSysBookings.reduce((sum, b) => sum + Number(b.duration || 0), 0);
+            // Cumulative booked hours for this system (stays intact after session ends)
+            const allSysBooked = validBookedSlots.filter((b) => b.system_id === sys);
+            const sysHours = allSysBooked.reduce((sum, b) => sum + Number(b.duration || 0), 0);
 
-            const filteredSysBookings = allSysBookings.filter((b) => {
+            // Visible cards on the board for this system
+            const visibleSysBookings = kanbanBookings.filter((b) => b.system_id === sys);
+            const activeSysBookings = visibleSysBookings.filter((b) => b.status !== 'No-Show');
+
+            const filteredSysBookings = visibleSysBookings.filter((b) => {
               if (statusFilter === 'All') return true;
               if (statusFilter === 'Upcoming') return b.status === 'Locked';
               if (statusFilter === 'Pushed') return b.status === 'Pushed';
@@ -881,7 +886,7 @@ export default function GTADashboard() {
                     <Monitor size={18} className="text-[#00D0FF]" /> {sys}
                   </h2>
                   <span className="text-xs font-bold text-gray-400 bg-[#1A2235] px-2.5 py-1 rounded">
-                    {activeSysBookings.length} Slots • {sysHours}h
+                    {allSysBooked.length} Slots • {sysHours}h
                   </span>
                 </div>
 
