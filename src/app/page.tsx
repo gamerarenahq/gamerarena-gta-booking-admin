@@ -135,10 +135,11 @@ const getISTParts = () => {
 
 const getTodayString = () => getISTParts().dateStr;
 
-// Calculates base cost for PS5
+// Calculates base cost for PS5: ₹150 per full hour + ₹100 for a 30-min extension
 const getPrice = (dur: number, extra: number = 0) => {
-  const full = Math.floor(dur);
-  const half = dur % 1 !== 0 ? 1 : 0;
+  const numericDur = Number(dur) || 0;
+  const full = Math.floor(numericDur);
+  const half = numericDur % 1 !== 0 ? 1 : 0;
   return full * (150 + extra * 100) + half * (100 + extra * 100);
 };
 
@@ -149,8 +150,9 @@ const buildWhatsAppText = (b: Booking) => {
   const d = parts[2];
   const dateObj = new Date(Number(y), Number(m) - 1, Number(d));
   const niceDate = `${d} ${dateObj.toLocaleString('en-US', { month: 'short' })} ${y}`;
+  const totalBill = getPrice(Number(b.duration), 0);
 
-  return `Dear *${b.customer_name}*,\n\nThank you for choosing Gamerarena! Your exclusive GTA VI slot has been successfully secured. Here are your booking details:\n\n📅 *Date:* ${niceDate}\n⏰ *Start Time:* ${b.start_time}\n⏳ *Duration:* ${b.duration} Hours\n🎮 *Console:* ${b.system_id}\n\n*⚠️ House Rules for Launch Week:*\n• *10-Minute Grace Period:* If you arrive more than 10 minutes late, your slot may be reassigned to the next waiting player.\n• *Hard Stops:* To ensure everyone gets their turn, sessions must end strictly on time if another gamer is scheduled after you.\n\nSee you at the arena! 🎮`;
+  return `Dear *${b.customer_name}*,\n\nThank you for choosing Gamerarena! Your exclusive GTA VI slot has been successfully secured. Here are your booking details:\n\n📅 *Date:* ${niceDate}\n⏰ *Start Time:* ${b.start_time}\n⏳ *Duration:* ${b.duration} Hours\n🎮 *Console:* ${b.system_id}\n💰 *Total Amount:* ₹${totalBill}\n\n*⚠️ House Rules for Launch Week:*\n• *10-Minute Grace Period:* If you arrive more than 10 minutes late, your slot may be reassigned to the next waiting player.\n• *Hard Stops:* To ensure everyone gets their turn, sessions must end strictly on time if another gamer is scheduled after you.\n\nSee you at the arena! 🎮`;
 };
 
 const buildWhatsAppUrl = (b: Booking) => {
@@ -484,7 +486,6 @@ export default function GTADashboard() {
 
     setExtendingId(b.id);
     try {
-      // 1. Update gta_bookings duration
       const { error: bookingError } = await supabase
         .from('gta_bookings')
         .update({ duration: newDuration })
@@ -492,7 +493,6 @@ export default function GTADashboard() {
 
       if (bookingError) throw bookingError;
 
-      // 2. Sync updated duration & base gaming total to matching Active session in live POS `sales` table
       const { data: matchingSales, error: salesFetchError } = await supabase
         .from('sales')
         .select('id, customer, system, fnb_total')
@@ -521,7 +521,7 @@ export default function GTADashboard() {
       }
 
       await fetchBookings(dateFilter, true);
-      alert(`Extended ${b.customer_name} by +${extraHours}h (Now ends at ${newEndFormatted}).`);
+      alert(`Extended ${b.customer_name} by +${extraHours}h (Now ends at ${newEndFormatted}, Total: ₹${getPrice(newDuration, 0)}).`);
     } catch (err) {
       console.error('Extend error:', err);
       alert('Error extending live session.');
@@ -607,7 +607,6 @@ export default function GTADashboard() {
         }
       }
 
-      // 1. Inject into live POS
       const { error: liveError } = await supabase.from('sales').insert([
         {
           customer: selectedBooking.customer_name,
@@ -625,7 +624,6 @@ export default function GTADashboard() {
 
       if (liveError) throw liveError;
 
-      // 2. Mark as Pushed on dashboard
       await supabase.from('gta_bookings').update({ status: 'Pushed' }).eq('id', selectedBooking.id);
 
       setModal(null);
@@ -695,12 +693,10 @@ export default function GTADashboard() {
     };
   };
 
-  // Bookings strictly matching the active dateFilter (excluding No-Show from total booked hours)
   const activeDateBookings = bookings.filter((b) => b.booking_date === dateFilter);
   const validBookedSlots = activeDateBookings.filter((b) => b.status !== 'No-Show');
   const totalBookedHours = validBookedSlots.reduce((sum, b) => sum + Number(b.duration || 0), 0);
 
-  // Open windows for the currently selected console/date in the booking modal
   const modalOpenWindows =
     modal === 'booking' && formDate
       ? getAvailableSlots1HrPlus(
@@ -814,7 +810,7 @@ export default function GTADashboard() {
             </div>
           </div>
 
-          {/* OPEN SLOTS STRIP (Selected Date Only, 10 AM - 12 AM Midnight, Minimum 1 Hour) */}
+          {/* OPEN SLOTS STRIP */}
           <div className="pt-3 border-t border-[#1E293B] grid grid-cols-1 md:grid-cols-3 gap-2.5">
             {SYSTEMS.map((sys) => {
               const isDateSynced = loadedDate === dateFilter && !isFetching;
@@ -904,15 +900,14 @@ export default function GTADashboard() {
                       const startMins = timeToMinutes(b.start_time);
                       const endMins = startMins + Number(b.duration) * 60;
                       const endTimeFormatted = minutesTo12Hour(endMins);
+                      const bookingTotal = getPrice(Number(b.duration), 0);
 
-                      // Buffer available right after this session before next booking or midnight
                       const bufferMins =
                         b.status !== 'No-Show' ? getAvailableBufferMins(b, activeSysBookings) : 0;
                       const canExtend30m = bufferMins >= 30;
                       const canExtend1h = bufferMins >= 60;
                       const isExtendingThis = extendingId === b.id;
 
-                      // Check if another active booking on the same system starts immediately at endMins (Hard Stop)
                       const hasBackToBackNext =
                         b.status !== 'No-Show' &&
                         activeSysBookings.some(
@@ -951,7 +946,9 @@ export default function GTADashboard() {
                               >
                                 {b.start_time} – {endTimeFormatted}
                               </p>
-                              <p className="text-gray-500 text-[10px] font-bold uppercase mt-1.5">{b.duration}h Block</p>
+                              <p className="text-gray-400 text-[10px] font-bold uppercase mt-1.5">
+                                {b.duration}h • <span className="text-emerald-400 font-black">₹{bookingTotal}</span>
+                              </p>
                             </div>
                           </div>
 
@@ -1002,7 +999,7 @@ export default function GTADashboard() {
                                       : 'Less than 30m buffer before next slot'
                                   }
                                 >
-                                  {isExtendingThis ? 'Updating...' : '+30m Extend'}
+                                  {isExtendingThis ? 'Updating...' : '+30m Extend (+₹100)'}
                                 </button>
                                 <button
                                   type="button"
@@ -1015,7 +1012,7 @@ export default function GTADashboard() {
                                       : 'Less than 1h buffer before next slot'
                                   }
                                 >
-                                  {isExtendingThis ? 'Updating...' : '+1h Extend'}
+                                  {isExtendingThis ? 'Updating...' : '+1h Extend (+₹150)'}
                                 </button>
                               </div>
                             </div>
@@ -1125,6 +1122,9 @@ export default function GTADashboard() {
                     ⏰ Time: {selectedBooking.start_time} – {minutesTo12Hour(timeToMinutes(selectedBooking.start_time) + Number(selectedBooking.duration) * 60)} ({selectedBooking.duration}h)
                   </p>
                   <p className="text-gray-400 text-xs font-bold">🎮 Console: {selectedBooking.system_id}</p>
+                  <p className="text-emerald-400 text-xs font-black">
+                    💰 Total Amount: ₹{getPrice(Number(selectedBooking.duration), 0)}
+                  </p>
                 </div>
 
                 <div className="flex flex-col gap-3">
@@ -1250,7 +1250,9 @@ export default function GTADashboard() {
                       />
                     </div>
                     <div>
-                      <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">Duration (Min 1h)</label>
+                      <label className="text-[10px] text-gray-500 font-bold uppercase ml-1 mb-1.5 block">
+                        Duration • <span className="text-emerald-400">₹{getPrice(duration, 0)}</span>
+                      </label>
                       <div className="flex justify-between items-center bg-[#0B0E14] mt-0.5 p-2 rounded-xl border border-[#2D3748]">
                         <button
                           type="button"
@@ -1330,7 +1332,7 @@ export default function GTADashboard() {
                       disabled={isProcessing || isOverlapping || !startTime24 || duration < 1 || !name.trim() || phone.trim().length < 10}
                       className="w-full bg-[#00D0FF] text-black py-4 rounded-xl font-black text-sm disabled:opacity-30 hover:bg-white transition-all shadow-[0_0_15px_rgba(0,208,255,0.2)]"
                     >
-                      {isProcessing ? 'Saving...' : selectedBooking ? 'Save Changes' : 'Lock Slot'}
+                      {isProcessing ? 'Saving...' : selectedBooking ? 'Save Changes' : `Lock Slot • ₹${getPrice(duration, 0)}`}
                     </button>
                   </div>
                 </div>
