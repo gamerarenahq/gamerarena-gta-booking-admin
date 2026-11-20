@@ -152,28 +152,15 @@ const isPosSaleBlocking = (sale: PosSale) => {
   return !['completed', 'closed', 'paid', 'settled', 'cancelled', 'canceled'].includes(st);
 };
 
-// Compute start & end minutes for a POS `sales` row (Active session or POS-created booking)
-const getPosSaleWindow = (
-  sale: PosSale,
-  selectedDate: string,
-  istNow: { dateStr: string; currentMinutes: number }
-): TimeWindow => {
-  const start = sale.entry_time
-    ? timeToMinutes(sale.entry_time)
-    : selectedDate === istNow.dateStr
-      ? istNow.currentMinutes
-      : OPENING_MINS;
+// Compute exact scheduled start & end minutes for a POS `sales` row
+const getPosSaleWindow = (sale: PosSale): TimeWindow => {
+  const start = sale.entry_time ? timeToMinutes(sale.entry_time) : OPENING_MINS;
   const durHours = Number(sale.duration) > 0 ? Number(sale.duration) : 1;
-  const rawEnd = start + durHours * 60;
-
-  // If currently Active on today's floor and slightly past planned end, block at least 15m ahead
-  const isCurrentlyActive =
-    selectedDate === istNow.dateStr && (sale.status || '').trim().toLowerCase() === 'active';
-  const effectiveEnd = isCurrentlyActive ? Math.max(rawEnd, istNow.currentMinutes + 15) : rawEnd;
+  const end = start + durHours * 60;
 
   return {
     start,
-    end: Math.min(CLOSING_MINS, effectiveEnd),
+    end: Math.min(CLOSING_MINS, end),
   };
 };
 
@@ -222,8 +209,8 @@ const getAvailableSlots1HrPlus = (
       return { start, end };
     });
 
-  // Include ALL blocking POS entries (Active floor sessions + bookings entered directly in POS)
-  const posSaleBlocks = sysPosSales.map((s) => getPosSaleWindow(s, selectedDate, istNow));
+  // Include ALL blocking POS entries strictly by their scheduled start & end window
+  const posSaleBlocks = sysPosSales.map((s) => getPosSaleWindow(s));
 
   const blocks = [...bookingBlocks, ...posSaleBlocks]
     .filter((block) => block.end > startBoundary && block.start < CLOSING_MINS)
@@ -439,7 +426,7 @@ export default function GTADashboard() {
   const externalPosHours = externalPosSales.reduce((sum, s) => sum + Number(s.duration || 0), 0);
   const totalBookedHours = gtaBookedHours + externalPosHours;
 
-  // Smart Collision Logic for Modal (checks both GTA bookings AND POS-entered bookings/sessions)
+  // Smart Collision Logic for Modal (checks both GTA bookings AND scheduled POS windows)
   let isOverlapping = false;
   let overlapWarning = '';
 
@@ -470,12 +457,12 @@ export default function GTADashboard() {
         ) {
           return false;
         }
-        const win = getPosSaleWindow(s, formDate, nowTick);
+        const win = getPosSaleWindow(s);
         return newStart < win.end && newEnd > win.start;
       });
 
       if (posConflict) {
-        const win = getPosSaleWindow(posConflict, formDate, nowTick);
+        const win = getPosSaleWindow(posConflict);
         isOverlapping = true;
         overlapWarning = `${formSystem} booked in POS (${posConflict.customer}: ${minutesTo12Hour(win.start)} – ${minutesTo12Hour(win.end)})`;
       }
@@ -528,12 +515,11 @@ export default function GTADashboard() {
     if (b.booking_date === dateFilter) {
       const posCollision = posSales.find((s) => {
         if (s.system !== targetSys) return false;
-        if (b.status === 'Pushed' && (s.status || '').trim().toLowerCase() === 'active') return true;
-        const win = getPosSaleWindow(s, b.booking_date, nowTick);
+        const win = getPosSaleWindow(s);
         return start < win.end && end > win.start;
       });
       if (posCollision) {
-        const win = getPosSaleWindow(posCollision, b.booking_date, nowTick);
+        const win = getPosSaleWindow(posCollision);
         return `${posCollision.customer} in POS on ${targetSys} (${minutesTo12Hour(win.start)} – ${minutesTo12Hour(win.end)})`;
       }
     }
@@ -713,7 +699,7 @@ export default function GTADashboard() {
             s.customer.trim().toLowerCase() === b.customer_name.trim().toLowerCase()
           )
       )
-      .map((s) => getPosSaleWindow(s, b.booking_date, nowTick).start)
+      .map((s) => getPosSaleWindow(s).start)
       .filter((start) => start >= endMins);
 
     const allNextStarts = [...upcomingBookingStarts, ...upcomingPosStarts].sort((a, c) => a - c);
@@ -984,7 +970,7 @@ export default function GTADashboard() {
                   Booking x <span className="text-[#00D0FF]">Gamerarena</span>
                 </h1>
                 <p className="text-gray-500 text-[10px] font-bold tracking-widest uppercase mt-0.5">
-                  Pre-Booking Management • Synced with POS Bookings & Live Floor (10 AM – 12 AM)
+                  Pre-Booking Management • Schedule-Synced (10 AM – 12 AM)
                 </p>
               </div>
 
@@ -1045,7 +1031,7 @@ export default function GTADashboard() {
             </div>
           </div>
 
-          {/* OPEN SLOTS STRIP (Accounts for GTA Bookings + All POS Bookings & Active Floor Sessions) */}
+          {/* OPEN SLOTS STRIP (Uses Exact Scheduled Windows from Bookings & POS) */}
           <div className="pt-3 border-t border-[#1E293B] grid grid-cols-1 md:grid-cols-3 gap-2.5">
             {SYSTEMS.map((sys) => {
               const isDateSynced = loadedDate === dateFilter && !isFetching;
@@ -1075,7 +1061,7 @@ export default function GTADashboard() {
                       {activeFloorSale ? (
                         <span className="text-[10px] font-black text-amber-300 bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 rounded flex items-center gap-1 truncate">
                           <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
-                          Live: {activeFloorSale.customer} (till {minutesTo12Hour(getPosSaleWindow(activeFloorSale, dateFilter, nowTick).end)})
+                          Live: {activeFloorSale.customer} ({minutesTo12Hour(getPosSaleWindow(activeFloorSale).start)} – {minutesTo12Hour(getPosSaleWindow(activeFloorSale).end)})
                         </span>
                       ) : queuedPosCount > 0 ? (
                         <span className="text-[10px] font-black text-purple-300 bg-purple-500/15 border border-purple-500/30 px-2 py-0.5 rounded">
@@ -1092,7 +1078,7 @@ export default function GTADashboard() {
                       <span className="text-[11px] font-bold text-gray-500">Checking slots...</span>
                     ) : openWindows.length === 0 ? (
                       <span className="text-[11px] font-bold text-red-400">
-                        {sysPosSales.length > 0 ? 'Busy / Booked in POS • No 1h+ slot' : 'No 1h+ slots left'}
+                        {sysPosSales.length > 0 ? 'Scheduled / Booked in POS • No 1h+ slot' : 'No 1h+ slots left'}
                       </span>
                     ) : (
                       openWindows.map((win, idx) => (
@@ -1120,11 +1106,7 @@ export default function GTADashboard() {
             const allSysBooked = validBookedSlots.filter((b) => b.system_id === sys);
             const sysExternalPosSales = externalPosSales
               .filter((s) => s.system === sys)
-              .sort(
-                (a, b) =>
-                  getPosSaleWindow(a, dateFilter, nowTick).start -
-                  getPosSaleWindow(b, dateFilter, nowTick).start
-              );
+              .sort((a, b) => getPosSaleWindow(a).start - getPosSaleWindow(b).start);
 
             const gtaSysHours = allSysBooked.reduce((sum, b) => sum + Number(b.duration || 0), 0);
             const posSysHours = sysExternalPosSales.reduce((sum, s) => sum + Number(s.duration || 0), 0);
@@ -1159,7 +1141,7 @@ export default function GTADashboard() {
                 <div className="p-4 flex-1 overflow-y-auto custom-scrollbar space-y-4">
                   {/* POS-Entered Bookings & Live Floor Walk-In Cards for this Console */}
                   {sysExternalPosSales.map((sale, idx) => {
-                    const win = getPosSaleWindow(sale, dateFilter, nowTick);
+                    const win = getPosSaleWindow(sale);
                     const isLiveActive = (sale.status || '').trim().toLowerCase() === 'active';
                     return (
                       <div
@@ -1175,7 +1157,7 @@ export default function GTADashboard() {
                             {sale.customer}
                           </p>
                           <p className="text-[10px] font-bold text-gray-400 uppercase mt-0.5">
-                            {Number(sale.duration || 1)}h Block • Blocked in Schedule
+                            {Number(sale.duration || 1)}h Block • Scheduled in POS
                           </p>
                         </div>
                         <span className="text-xs font-black text-amber-300 bg-amber-500/15 border border-amber-500/30 px-2.5 py-1 rounded-lg shrink-0">
@@ -1218,7 +1200,7 @@ export default function GTADashboard() {
                               !(
                                 b.status === 'Pushed' &&
                                 s.customer.trim().toLowerCase() === b.customer_name.trim().toLowerCase()
-                              ) && getPosSaleWindow(s, b.booking_date, nowTick).start === endMins
+                              ) && getPosSaleWindow(s).start === endMins
                           ));
 
                       const otherConsoles = SYSTEMS.filter((s) => s !== b.system_id);
