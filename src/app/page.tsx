@@ -48,6 +48,7 @@ type ActiveSale = {
   customer: string;
   system: string;
   status: string;
+  entry_time?: string;
   duration?: number;
   total?: number;
   fnb_total?: number;
@@ -144,6 +145,19 @@ const getPrice = (dur: number, extra: number = 0) => {
   return full * (150 + extra * 100) + half * (100 + extra * 100);
 };
 
+// Compute start & end minutes for an active live-floor POS sale
+const getActiveSaleWindow = (sale: ActiveSale, fallbackStartMins: number): TimeWindow => {
+  const start = sale.entry_time ? timeToMinutes(sale.entry_time) : fallbackStartMins;
+  const durHours = Number(sale.duration) > 0 ? Number(sale.duration) : 1;
+  // Ensure an active floor session blocks at least through the current time + 15m if overrun
+  const rawEnd = start + durHours * 60;
+  const effectiveEnd = Math.max(rawEnd, fallbackStartMins + 15);
+  return {
+    start,
+    end: Math.min(CLOSING_MINS, effectiveEnd),
+  };
+};
+
 const buildWhatsAppText = (b: Booking) => {
   const parts = b.booking_date.split('-');
   const y = parts[0];
@@ -167,6 +181,7 @@ const buildWhatsAppUrl = (b: Booking) => {
 
 const getAvailableSlots1HrPlus = (
   sysBookings: Booking[],
+  sysActiveSales: ActiveSale[],
   selectedDate: string,
   istNow: { dateStr: string; currentMinutes: number }
 ): TimeWindow[] => {
@@ -180,13 +195,21 @@ const getAvailableSlots1HrPlus = (
 
   if (startBoundary >= CLOSING_MINS) return [];
 
-  const blocks = sysBookings
+  const bookingBlocks = sysBookings
     .filter((b) => b.booking_date === selectedDate && b.status !== 'No-Show')
     .map((b) => {
       const start = timeToMinutes(b.start_time);
       const end = start + Number(b.duration) * 60;
       return { start, end };
-    })
+    });
+
+  // Also include any active walk-in / non-GTA sessions currently running on the Live Floor
+  const liveSaleBlocks =
+    selectedDate === istNow.dateStr
+      ? sysActiveSales.map((s) => getActiveSaleWindow(s, istNow.currentMinutes))
+      : [];
+
+  const blocks = [...bookingBlocks, ...liveSaleBlocks]
     .filter((block) => block.end > startBoundary && block.start < CLOSING_MINS)
     .sort((a, b) => a.start - b.start);
 
@@ -252,7 +275,7 @@ export default function GTADashboard() {
         supabase.from('gta_bookings').select('*').eq('booking_date', targetDate),
         supabase
           .from('sales')
-          .select('id, customer, system, status, duration, total, fnb_total')
+          .select('id, customer, system, status, entry_time, duration, total, fnb_total')
           .eq('date', targetDate)
           .eq('status', 'Active'),
       ]);
@@ -317,6 +340,7 @@ export default function GTADashboard() {
   useEffect(() => {
     if (isAuthenticated && dateFilter) {
       setBookings([]);
+      setActiveSales([]);
       fetchBookings(dateFilter, false);
     }
   }, [dateFilter, isAuthenticated, fetchBookings]);
@@ -382,7 +406,7 @@ export default function GTADashboard() {
     );
   });
 
-  // Smart Collision Logic for Modal (ignores No-Show bookings and finished POS sessions)
+  // Smart Collision Logic for Modal (checks both GTA bookings AND active Live Floor walk-in sessions)
   let isOverlapping = false;
   let overlapWarning = '';
 
@@ -390,7 +414,7 @@ export default function GTADashboard() {
     const newStart = timeToMinutes(startTime24);
     const newEnd = newStart + duration * 60;
 
-    const conflict = kanbanBookings.find((b) => {
+    const bookingConflict = kanbanBookings.find((b) => {
       if (b.status === 'No-Show') return false;
       if (selectedBooking && b.id === selectedBooking.id) return false;
       if (b.system_id !== formSystem || b.booking_date !== formDate) return false;
@@ -400,9 +424,30 @@ export default function GTADashboard() {
       return newStart < bEnd && newEnd > bStart;
     });
 
-    if (conflict) {
+    if (bookingConflict) {
       isOverlapping = true;
-      overlapWarning = `Overlaps with ${conflict.customer_name} (${conflict.start_time} – ${minutesTo12Hour(timeToMinutes(conflict.start_time) + Number(conflict.duration) * 60)})`;
+      overlapWarning = `Overlaps with ${bookingConflict.customer_name} (${bookingConflict.start_time} – ${minutesTo12Hour(timeToMinutes(bookingConflict.start_time) + Number(bookingConflict.duration) * 60)})`;
+    } else if (formDate === nowTick.dateStr) {
+      // Check against active walk-in / non-GTA sessions on the Live Floor
+      const liveFloorConflict = activeSales.find((s) => {
+        if (s.system !== formSystem) return false;
+        // Skip if this sale belongs to the exact booking we are currently editing
+        if (
+          selectedBooking &&
+          selectedBooking.status === 'Pushed' &&
+          s.customer.trim().toLowerCase() === selectedBooking.customer_name.trim().toLowerCase()
+        ) {
+          return false;
+        }
+        const win = getActiveSaleWindow(s, nowTick.currentMinutes);
+        return newStart < win.end && newEnd > win.start;
+      });
+
+      if (liveFloorConflict) {
+        const win = getActiveSaleWindow(liveFloorConflict, nowTick.currentMinutes);
+        isOverlapping = true;
+        overlapWarning = `${formSystem} busy on Live Floor (${liveFloorConflict.customer} until ${minutesTo12Hour(win.end)})`;
+      }
     }
   }
 
@@ -449,11 +494,16 @@ export default function GTADashboard() {
     const start = timeToMinutes(b.start_time);
     const end = start + Number(b.duration) * 60;
 
-    // Also block moving a Pushed session if targetSys already has a different Active floor session running right now
-    if (b.status === 'Pushed') {
-      const liveFloorCollision = activeSales.find((s) => s.system === targetSys);
+    if (b.booking_date === nowTick.dateStr) {
+      const liveFloorCollision = activeSales.find((s) => {
+        if (s.system !== targetSys) return false;
+        if (b.status === 'Pushed') return true;
+        const win = getActiveSaleWindow(s, nowTick.currentMinutes);
+        return start < win.end && end > win.start;
+      });
       if (liveFloorCollision) {
-        return `${liveFloorCollision.customer} is active on ${targetSys}`;
+        const win = getActiveSaleWindow(liveFloorCollision, nowTick.currentMinutes);
+        return `${liveFloorCollision.customer} active on ${targetSys} until ${minutesTo12Hour(win.end)}`;
       }
     }
 
@@ -499,7 +549,7 @@ export default function GTADashboard() {
     }
   };
 
-  // Atomically swap two bookings' console & start time (for shuffling back-to-back slots cleanly)
+  // Atomically swap two bookings' console & start time
   const handleSwapBookings = async () => {
     if (!selectedBooking || !swapTargetId || isProcessing) return;
     const targetBooking = kanbanBookings.find((b) => String(b.id) === swapTargetId);
@@ -833,12 +883,22 @@ export default function GTADashboard() {
               b.booking_date === formDate &&
               (!selectedBooking || b.id !== selectedBooking.id)
           ),
+          formDate === dateFilter
+            ? activeSales.filter(
+                (s) =>
+                  s.system === formSystem &&
+                  !(
+                    selectedBooking &&
+                    selectedBooking.status === 'Pushed' &&
+                    s.customer.trim().toLowerCase() === selectedBooking.customer_name.trim().toLowerCase()
+                  )
+              )
+            : [],
           formDate,
           nowTick
         )
       : [];
 
-  // Other active/upcoming bookings on the same date that can be swapped with `selectedBooking`
   const swappableBookings =
     modal === 'booking' && selectedBooking
       ? kanbanBookings.filter(
@@ -884,7 +944,7 @@ export default function GTADashboard() {
                   Booking x <span className="text-[#00D0FF]">Gamerarena</span>
                 </h1>
                 <p className="text-gray-500 text-[10px] font-bold tracking-widest uppercase mt-0.5">
-                  Pre-Booking Management • 1h+ Slots (10 AM – 12 AM)
+                  Pre-Booking Management • Live Floor Aware (10 AM – 12 AM)
                 </p>
               </div>
 
@@ -945,34 +1005,46 @@ export default function GTADashboard() {
             </div>
           </div>
 
-          {/* OPEN SLOTS STRIP */}
+          {/* OPEN SLOTS STRIP (Accounts for both GTA Bookings AND Live Floor POS Sessions) */}
           <div className="pt-3 border-t border-[#1E293B] grid grid-cols-1 md:grid-cols-3 gap-2.5">
             {SYSTEMS.map((sys) => {
               const isDateSynced = loadedDate === dateFilter && !isFetching;
+              const sysLiveSales = activeSales.filter((s) => s.system === sys);
               const openWindows = isDateSynced
                 ? getAvailableSlots1HrPlus(
                     kanbanBookings.filter((b) => b.system_id === sys),
+                    sysLiveSales,
                     dateFilter,
                     nowTick
                   )
                 : [];
-              const hasActiveFloorSession = activeSales.some((s) => s.system === sys);
+              const liveFloorSale = sysLiveSales[0];
 
               return (
-                <div key={sys} className="bg-[#0B0E14] border border-[#2D3748] rounded-xl px-3 py-2 flex items-center gap-2.5 min-w-0">
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <span className="text-xs font-black text-[#00D0FF] bg-[#00D0FF]/10 px-2 py-0.5 rounded">
-                      {sys}
-                    </span>
-                    {hasActiveFloorSession && (
-                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" title="Active session on Live Floor" />
-                    )}
+                <div key={sys} className="bg-[#0B0E14] border border-[#2D3748] rounded-xl px-3 py-2 flex flex-col justify-center gap-1.5 min-w-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <span className="text-xs font-black text-[#00D0FF] bg-[#00D0FF]/10 px-2 py-0.5 rounded">
+                        {sys}
+                      </span>
+                      {liveFloorSale ? (
+                        <span className="text-[10px] font-black text-amber-300 bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 rounded flex items-center gap-1">
+                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                          Live Floor: {liveFloorSale.customer} (till {minutesTo12Hour(getActiveSaleWindow(liveFloorSale, nowTick.currentMinutes).end)})
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-bold text-gray-500">Floor Free</span>
+                      )}
+                    </div>
                   </div>
+
                   <div className="flex flex-wrap gap-1.5 min-w-0">
                     {!isDateSynced ? (
                       <span className="text-[11px] font-bold text-gray-500">Checking slots...</span>
                     ) : openWindows.length === 0 ? (
-                      <span className="text-[11px] font-bold text-red-400">No 1h+ slots left</span>
+                      <span className="text-[11px] font-bold text-red-400">
+                        {liveFloorSale ? `Busy on Live Floor • No 1h+ slot left` : 'No 1h+ slots left'}
+                      </span>
                     ) : (
                       openWindows.map((win, idx) => (
                         <button
@@ -996,13 +1068,25 @@ export default function GTADashboard() {
         {/* KANBAN BOARD */}
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-6 lg:min-h-0 overflow-y-auto lg:overflow-hidden">
           {SYSTEMS.map((sys) => {
-            // Cumulative booked hours for this system (stays intact after session ends)
             const allSysBooked = validBookedSlots.filter((b) => b.system_id === sys);
             const sysHours = allSysBooked.reduce((sum, b) => sum + Number(b.duration || 0), 0);
 
-            // Visible cards on the board for this system
             const visibleSysBookings = kanbanBookings.filter((b) => b.system_id === sys);
             const activeSysBookings = visibleSysBookings.filter((b) => b.status !== 'No-Show');
+
+            // Detect non-GTA / walk-in session running directly on the Live Floor for this console
+            const nonGtaLiveSession =
+              dateFilter === nowTick.dateStr
+                ? activeSales.find(
+                    (s) =>
+                      s.system === sys &&
+                      !visibleSysBookings.some(
+                        (b) =>
+                          b.status === 'Pushed' &&
+                          b.customer_name.trim().toLowerCase() === s.customer.trim().toLowerCase()
+                      )
+                  )
+                : undefined;
 
             const filteredSysBookings = visibleSysBookings.filter((b) => {
               if (statusFilter === 'All') return true;
@@ -1026,11 +1110,29 @@ export default function GTADashboard() {
 
                 {/* Cards Area */}
                 <div className="p-4 flex-1 overflow-y-auto custom-scrollbar space-y-4">
+                  {/* Live Floor Walk-in / Non-GTA Occupied Banner */}
+                  {nonGtaLiveSession && (
+                    <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl p-3 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-[10px] font-black uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+                          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                          Live Floor Occupied (Walk-In / Other)
+                        </p>
+                        <p className="text-xs font-black text-white truncate mt-0.5">
+                          {nonGtaLiveSession.customer}
+                        </p>
+                      </div>
+                      <span className="text-[11px] font-black text-amber-300 bg-amber-500/15 px-2.5 py-1 rounded-lg shrink-0">
+                        Busy till {minutesTo12Hour(getActiveSaleWindow(nonGtaLiveSession, nowTick.currentMinutes).end)}
+                      </span>
+                    </div>
+                  )}
+
                   {isFetching ? (
                     <p className="text-center text-xs text-gray-500 font-bold mt-10">Loading...</p>
                   ) : filteredSysBookings.length === 0 ? (
                     <div className="text-center mt-10 border border-dashed border-[#2D3748] rounded-xl p-6">
-                      <p className="text-gray-500 text-xs font-bold uppercase tracking-widest">No Bookings</p>
+                      <p className="text-gray-500 text-xs font-bold uppercase tracking-widest">No GTA Bookings</p>
                     </div>
                   ) : (
                     filteredSysBookings.map((b) => {
@@ -1116,7 +1218,7 @@ export default function GTADashboard() {
                             </div>
                           )}
 
-                          {/* Quick Console Shift Bar (Available for both Upcoming and Live Floor sessions) */}
+                          {/* Quick Console Shift Bar */}
                           {b.status !== 'No-Show' && (
                             <div className="mb-2.5 flex items-center gap-1.5">
                               <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500 flex items-center gap-1 mr-1">
@@ -1373,7 +1475,7 @@ export default function GTADashboard() {
                 </div>
 
                 <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto custom-scrollbar">
-                  {/* Direct Atomic Slot Swap (Visible when editing an existing booking) */}
+                  {/* Direct Atomic Slot Swap */}
                   {selectedBooking && swappableBookings.length > 0 && (
                     <div className="bg-[#0B0E14] border border-[#00D0FF]/30 rounded-xl p-3 space-y-2">
                       <label className="text-[10px] text-[#00D0FF] font-black uppercase tracking-wider flex items-center gap-1.5">
